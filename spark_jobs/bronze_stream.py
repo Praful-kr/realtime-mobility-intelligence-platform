@@ -20,6 +20,7 @@ from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
 from spark_jobs.common import BRONZE_PATH, CHECKPOINT_ROOT, KAFKA_BOOTSTRAP, RAW_TOPIC, build_spark
+from spark_jobs.metrics import start_metrics
 
 APP_ID = "bronze-trips-raw"
 
@@ -57,6 +58,7 @@ def main() -> None:
     args = ap.parse_args()
 
     spark = build_spark("bronze-stream")
+    listener = start_metrics(spark)
     source = (spark.readStream.format("kafka")
               .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
               .option("subscribe", RAW_TOPIC)
@@ -77,7 +79,11 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, _graceful)
     signal.signal(signal.SIGINT, _graceful)
-    query.awaitTermination()
+    try:
+        query.awaitTermination()
+    finally:
+        if listener is not None:
+            spark.streams.removeListener(listener)
 
 
 if __name__ == "__main__":

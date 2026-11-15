@@ -24,6 +24,7 @@ from pyspark.sql.streaming import StreamingQuery, StreamingQueryListener
 from spark_jobs.common import CHECKPOINT_ROOT, SILVER_PATH, build_spark, wait_for_delta_table
 from spark_jobs.gold_aggregates import GOLD_SPECS, SILVER_NEEDED, GoldSpec
 from spark_jobs.gold_sinks import PgSink, delta_upsert
+from spark_jobs.metrics import start_metrics
 
 GOLD_ROOT = os.getenv("GOLD_ROOT", "s3a://lakehouse/gold")
 ZONES_PATH = os.getenv("ZONES_PATH", "/opt/app/data/tlc/taxi_zone_lookup.csv")
@@ -114,6 +115,7 @@ def main() -> None:
     wait_for_delta_table(spark, SILVER_PATH)
     listener = MetricsListener(pg)
     spark.streams.addListener(listener)
+    prom_listener = start_metrics(spark)
     queries = start_gold_queries(spark, SILVER_PATH, GOLD_ROOT, CHECKPOINT_ROOT, args.watermark, args.trigger,
                                  pg, load_zones(spark, ZONES_PATH), max_files_per_trigger=args.max_files_per_trigger)
 
@@ -130,6 +132,8 @@ def main() -> None:
             spark.streams.awaitAnyTermination()   # surfaces a failure in ANY query instead of hanging on the first
     finally:
         spark.streams.removeListener(listener)    # avoids py4j callback errors during JVM shutdown
+        if prom_listener is not None:
+            spark.streams.removeListener(prom_listener)
         spark.stop()
 
 

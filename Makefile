@@ -89,3 +89,24 @@ test-api:
 
 e2e-api:
 	$(PY) -m tests.e2e.api_check --n $(or $(N),300000) --null-every $(or $(NULLP),1009)
+
+# ---- Phase 6 Observability ----
+.PHONY: monitoring-up streaming-up streaming-down dashboards obs-check obs-demo
+monitoring-up:
+	$(COMPOSE) up -d --wait kafka-exporter prometheus grafana api
+
+streaming-up:   ## long-running Bronze/Silver/Gold jobs (Kafka UI is stopped to save RAM on an 8 GB Docker VM)
+	$(COMPOSE) stop kafka-ui
+	$(COMPOSE) --profile streaming up -d spark-bronze spark-silver spark-gold
+
+streaming-down:
+	$(COMPOSE) --profile streaming stop -t 60 spark-bronze spark-silver spark-gold
+
+dashboards:     ## regenerate dashboards/grafana/*.json from dashboards/build_dashboards.py
+	python3 dashboards/build_dashboards.py
+
+obs-check:
+	$(PY) -m tests.e2e.observability_check
+
+obs-demo:
+	bash infrastructure/scripts/observability_demo.sh

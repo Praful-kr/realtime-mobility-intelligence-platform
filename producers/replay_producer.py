@@ -26,10 +26,20 @@ from confluent_kafka.schema_registry.avro import AvroSerializer
 from confluent_kafka.serialization import MessageField, SerializationContext
 
 from common.config import load_settings
+from prometheus_client import Counter, Gauge, start_http_server
+
 from common.logging_setup import get_logger
 from producers.events import COLUMN_MAPS, EventBuildError, ReplayClock, row_to_event
 
 log = get_logger("replay-producer")
+
+P_SENT = Counter("producer_events_sent_total", "Messages handed to Kafka (incl. injected duplicates/poison)")
+P_ACKED = Counter("producer_events_acked_total", "Messages acknowledged by all in-sync replicas")
+P_FAILED = Counter("producer_events_failed_total", "Messages whose delivery finally failed")
+P_DLQ = Counter("producer_dlq_events_total", "Records diverted to the dead-letter topic")
+P_BACKPRESSURE = Counter("producer_backpressure_events_total", "Times the local queue was full and produce() had to wait")
+P_QUEUE = Gauge("producer_queue_depth", "Messages waiting in the local producer queue")
+P_RUNNING = Gauge("producer_running", "1 while a replay is in progress")
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "trip_event_v1.avsc"
 UNIFIED = ["pickup_ts", "dropoff_ts", "vendor_id", "passenger_count", "trip_distance", "ratecode_id",
            "store_and_fwd_flag", "pu_location_id", "do_location_id", "payment_type", "fare_amount",
@@ -63,6 +73,7 @@ class ReplayProducer:
         self.args = args
         self.stop = False
         self.sent = self.acked = self.failed = self.dlq = self.backpressure_events = 0
+        self._synced: dict = {}
         self.injected_dups = self.injected_poison = self.injected_null_pickup = self.injected_late = 0
         sr = SchemaRegistryClient({"url": self.s.schema_registry_url})
         self.serializer = AvroSerializer(sr, SCHEMA_PATH.read_text(), conf={"auto.register.schemas": True})
@@ -105,6 +116,16 @@ class ReplayProducer:
                 if self.stop:
                     raise
 
+    def _sync_metrics(self) -> None:
+        """Publish deltas of the plain counters (hot path stays free of Prometheus calls)."""
+        last = self._synced
+        for counter, now in ((P_SENT, self.sent), (P_ACKED, self.acked), (P_FAILED, self.failed),
+                             (P_DLQ, self.dlq), (P_BACKPRESSURE, self.backpressure_events)):
+            if now > last.get(counter, 0):
+                counter.inc(now - last.get(counter, 0))
+                last[counter] = now
+        P_QUEUE.set(len(self.producer))
+
     # -- main loop -----------------------------------------------------------------------
     def run(self) -> int:
         files = {t: Path(self.args.data_dir) / f"{t}_tripdata_{self.args.month}.parquet"
@@ -113,7 +134,8 @@ class ReplayProducer:
         total = min(table.num_rows, self.args.limit) if self.args.limit else table.num_rows
         log.info("replay starting", extra={"rows": total, "speed": self.args.speed, "topic": self.s.raw_topic})
         clock = ReplayClock(self.args.speed, self.args.window_start, self.args.window_end, time.monotonic)
-        t0 = last_report = time.monotonic()
+        t0 = last_report = last_sync = time.monotonic()
+        P_RUNNING.set(1)
         # pace by wall clock only after the first in-window event, so setup time is excluded
         a = self.args
         deferred: list = []   # (release_pos, original_pos, row) for injected late arrivals
@@ -139,6 +161,9 @@ class ReplayProducer:
                     for _, orig_pos, late_row in due:
                         self._emit(late_row, orig_pos)
                 now = time.monotonic()
+                if now - last_sync >= 1:
+                    self._sync_metrics()
+                    last_sync = now
                 if now - last_report >= 5:
                     last_report = now
                     log.info("progress", extra={"sent": self.sent, "acked": self.acked, "failed": self.failed,
@@ -147,6 +172,8 @@ class ReplayProducer:
         for _, orig_pos, late_row in deferred:   # nothing may be silently lost at end of replay
             self._emit(late_row, orig_pos)
         remaining = self.producer.flush(60)
+        self._sync_metrics()
+        P_RUNNING.set(0)
         elapsed = time.monotonic() - t0
         log.info("replay finished", extra={"sent": self.sent, "acked": self.acked, "failed": self.failed,
                                            "dlq": self.dlq, "unflushed": remaining, "seconds": round(elapsed, 2),
@@ -203,6 +230,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--window-start", type=datetime.fromisoformat, default=datetime(2024, 1, 1))
     p.add_argument("--window-end", type=datetime.fromisoformat, default=datetime(2024, 2, 1))
     p.add_argument("--max-queue", type=int, default=100000)
+    p.add_argument("--metrics-port", type=int, default=8010, help="Prometheus /metrics port (0 = off)")
+    p.add_argument("--metrics-linger", type=float, default=12, help="seconds to keep /metrics up after the run")
     p.add_argument("--inject-late-every", type=int, default=0, help="delay every Nth event (late arrival)")
     p.add_argument("--late-by-events", type=int, default=3000, help="how many events later a late event is sent")
     p.add_argument("--inject-dup-every", type=int, default=0, help="re-send every Nth event (duplicate)")
@@ -213,7 +242,10 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 
 def main(argv=None) -> int:
-    rp = ReplayProducer(parse_args(argv))
+    args = parse_args(argv)
+    if args.metrics_port:
+        start_http_server(args.metrics_port)
+    rp = ReplayProducer(args)
 
     def _sig(_signum, _frame):
         log.warning("shutdown requested; flushing")
@@ -222,7 +254,10 @@ def main(argv=None) -> int:
     signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
     try:
-        return rp.run()
+        rc = rp.run()
+        if args.metrics_port and args.metrics_linger:
+            time.sleep(args.metrics_linger)   # let Prometheus scrape the final counter values
+        return rc
     except KafkaException as e:
         log.error("kafka error", extra={"error": str(e)})
         return 2

@@ -1,0 +1,515 @@
+{
+ "uid": "mobility-business",
+ "title": "Mobility Demand (Gold)",
+ "tags": [
+  "mobility"
+ ],
+ "timezone": "utc",
+ "schemaVersion": 39,
+ "version": 1,
+ "editable": false,
+ "refresh": "",
+ "time": {
+  "from": "2024-01-01T00:00:00.000Z",
+  "to": "2024-01-05T00:00:00.000Z"
+ },
+ "panels": [
+  {
+   "id": 1,
+   "type": "row",
+   "title": "Demand and revenue",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 0
+   }
+  },
+  {
+   "id": 2,
+   "type": "timeseries",
+   "title": "Trips per minute",
+   "description": "",
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     },
+     "rawSql": "SELECT window_start AS time, SUM(trips) AS trips FROM gold.trips_per_minute WHERE $__timeFilter(window_start) GROUP BY 1 ORDER BY 1",
+     "format": "time_series",
+     "rawQuery": true,
+     "editorMode": "code"
+    }
+   ],
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 7,
+    "w": 12,
+    "x": 0,
+    "y": 1
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "id": 3,
+   "type": "timeseries",
+   "title": "Revenue per hour ($)",
+   "description": "",
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     },
+     "rawSql": "SELECT window_start AS time, SUM(revenue) AS revenue FROM gold.hourly_demand WHERE $__timeFilter(window_start) GROUP BY 1 ORDER BY 1",
+     "format": "time_series",
+     "rawQuery": true,
+     "editorMode": "code"
+    }
+   ],
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 7,
+    "w": 12,
+    "x": 12,
+    "y": 1
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "currencyUSD"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "id": 4,
+   "type": "timeseries",
+   "title": "Rolling 15-minute demand (5-minute slide)",
+   "description": "",
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     },
+     "rawSql": "SELECT window_start AS time, trips FROM gold.demand_sliding_15m WHERE $__timeFilter(window_start) ORDER BY 1",
+     "format": "time_series",
+     "rawQuery": true,
+     "editorMode": "code"
+    }
+   ],
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 7,
+    "w": 12,
+    "x": 0,
+    "y": 8
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "id": 5,
+   "type": "timeseries",
+   "title": "Average trip duration per hour (min)",
+   "description": "",
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     },
+     "rawSql": "SELECT date_trunc('hour', window_start) AS time, SUM(duration_sum_s)::float / NULLIF(SUM(duration_n), 0) / 60 AS avg_minutes FROM gold.trips_per_minute WHERE $__timeFilter(window_start) GROUP BY 1 ORDER BY 1",
+     "format": "time_series",
+     "rawQuery": true,
+     "editorMode": "code"
+    }
+   ],
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 7,
+    "w": 12,
+    "x": 12,
+    "y": 8
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "id": 6,
+   "type": "row",
+   "title": "Where",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 15
+   }
+  },
+  {
+   "id": 7,
+   "type": "table",
+   "title": "Top 15 pickup zones",
+   "description": "",
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     },
+     "rawSql": "SELECT max(zone_name) AS zone, max(borough) AS borough, SUM(trips) AS trips FROM gold.zone_demand_5m WHERE role = 'pickup' AND $__timeFilter(window_start) GROUP BY zone_id ORDER BY trips DESC LIMIT 15",
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code"
+    }
+   ],
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 9,
+    "w": 8,
+    "x": 0,
+    "y": 16
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "id": 8,
+   "type": "table",
+   "title": "Top 15 drop-off zones",
+   "description": "",
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     },
+     "rawSql": "SELECT max(zone_name) AS zone, max(borough) AS borough, SUM(trips) AS trips FROM gold.zone_demand_5m WHERE role = 'dropoff' AND $__timeFilter(window_start) GROUP BY zone_id ORDER BY trips DESC LIMIT 15",
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code"
+    }
+   ],
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 9,
+    "w": 8,
+    "x": 8,
+    "y": 16
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "id": 9,
+   "type": "piechart",
+   "title": "Pickups by borough",
+   "description": "",
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     },
+     "rawSql": "SELECT COALESCE(borough, 'Unknown') AS borough, SUM(trips) AS trips FROM gold.zone_demand_5m WHERE role = 'pickup' AND $__timeFilter(window_start) GROUP BY 1 ORDER BY 2 DESC",
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code"
+    }
+   ],
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 9,
+    "w": 8,
+    "x": 16,
+    "y": 16
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "values": true,
+     "fields": "/^trips$/"
+    },
+    "pieType": "donut",
+    "legend": {
+     "displayMode": "table",
+     "placement": "right"
+    }
+   }
+  },
+  {
+   "id": 10,
+   "type": "row",
+   "title": "Hour of day and anomalies",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 25
+   }
+  },
+  {
+   "id": 11,
+   "type": "barchart",
+   "title": "Demand by hour of day",
+   "description": "",
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     },
+     "rawSql": "SELECT hour_of_day::text AS hour, SUM(trips) AS trips FROM gold.v_demand_by_hour_of_day GROUP BY hour_of_day ORDER BY hour_of_day",
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code"
+    }
+   ],
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 7,
+    "w": 12,
+    "x": 0,
+    "y": 26
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "xField": "hour",
+    "legend": {
+     "displayMode": "list"
+    }
+   }
+  },
+  {
+   "id": 12,
+   "type": "timeseries",
+   "title": "Trip outliers per minute, by type",
+   "description": "Speed > 80 mph, fare/mile > $50, tip > $100, duration > 4 h.",
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     },
+     "rawSql": "SELECT window_start AS time, anomaly_type AS metric, SUM(n) AS n FROM gold.anomaly_counts WHERE $__timeFilter(window_start) GROUP BY 1, 2 ORDER BY 1",
+     "format": "time_series",
+     "rawQuery": true,
+     "editorMode": "code"
+    }
+   ],
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 7,
+    "w": 12,
+    "x": 12,
+    "y": 26
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "id": 13,
+   "type": "table",
+   "title": "Demand anomalies (|z| > 3 vs trailing hour)",
+   "description": "",
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     },
+     "rawSql": "SELECT window_start AS time, trips, round(trailing_mean::numeric, 1) AS trailing_mean, round(z_score::numeric, 1) AS z FROM gold.v_demand_anomalies WHERE $__timeFilter(window_start) ORDER BY abs(z_score) DESC LIMIT 10",
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code"
+    }
+   ],
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 7,
+    "w": 12,
+    "x": 0,
+    "y": 33
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {}
+  },
+  {
+   "id": 14,
+   "type": "stat",
+   "title": "Total trips / revenue in range",
+   "description": "",
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     },
+     "rawSql": "SELECT SUM(trips) AS trips FROM gold.hourly_demand WHERE $__timeFilter(window_start)",
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code"
+    },
+    {
+     "refId": "B",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "postgres"
+     },
+     "rawSql": "SELECT SUM(revenue) AS revenue FROM gold.hourly_demand WHERE $__timeFilter(window_start)",
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code"
+    }
+   ],
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "postgres"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 12,
+    "x": 12,
+    "y": 33
+   },
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area"
+   }
+  }
+ ],
+ "templating": {
+  "list": []
+ },
+ "annotations": {
+  "list": []
+ }
+}

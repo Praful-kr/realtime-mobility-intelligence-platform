@@ -27,6 +27,29 @@ x-kafka-env: &kafka-env
   KAFKA_HEAP_OPTS: ${KAFKA_HEAP}
   KAFKA_LOG_RETENTION_HOURS: 24
 
+x-spark-env: &spark-env
+  MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+  MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+  KAFKA_BOOTSTRAP: kafka-1:9092,kafka-2:9092,kafka-3:9092
+  S3_ENDPOINT: http://minio:9000
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: ${POSTGRES_USER}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  POSTGRES_DB: ${POSTGRES_DB}
+
+x-spark-stream: &spark-stream
+  image: mobility-spark:3.5.3
+  profiles: ["streaming"]
+  restart: on-failure
+  depends_on:
+    minio: {condition: service_healthy}
+    kafka-1: {condition: service_healthy}
+    postgres: {condition: service_healthy}
+  entrypoint: ["bash", "/opt/app/infrastructure/spark/submit.sh"]
+  volumes:
+    - ../:/opt/app:ro
+
 services:
   kafka-1:
     <<: *kafka-broker
@@ -159,6 +182,80 @@ services:
       retries: 5
       start_period: 10s
 
+  # ---- long-running streaming jobs (profile "streaming"): docker compose --profile streaming up -d ----
+  spark-bronze:
+    <<: *spark-stream
+    command: ["bronze_stream", "--trigger", "5"]
+    mem_limit: 1536m
+    environment: {<<: *spark-env, METRICS_PORT: "8001", SPARK_DRIVER_MEMORY: 768m}
+
+  spark-silver:
+    <<: *spark-stream
+    command: ["silver_stream", "--trigger", "5"]
+    mem_limit: 1792m
+    environment: {<<: *spark-env, METRICS_PORT: "8002", SPARK_DRIVER_MEMORY: 1g}
+
+  spark-gold:
+    <<: *spark-stream
+    command: ["gold_stream", "--trigger", "5", "--watermark", "30 minutes"]
+    mem_limit: 2g
+    environment: {<<: *spark-env, METRICS_PORT: "8003", SPARK_DRIVER_MEMORY: 1g}
+
+  # ---- observability ----
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.8.0
+    restart: unless-stopped
+    command: ["--kafka.server=kafka-1:9092", "--kafka.server=kafka-2:9092", "--kafka.server=kafka-3:9092",
+              "--topic.filter=trips\\..*", "--group.filter=.*"]
+    depends_on:
+      kafka-1: {condition: service_healthy}
+    mem_limit: 128m
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=7d",
+              "--web.enable-lifecycle"]
+    ports: ["9090:9090"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes:
+      - ../monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../monitoring/prometheus/rules.yml:/etc/prometheus/rules.yml:ro
+      - prometheus-data:/prometheus
+    mem_limit: 384m
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    restart: unless-stopped
+    depends_on:
+      prometheus: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+    ports: ["3000:3000"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/pipeline.json
+      API_DB_PASSWORD: ${API_DB_PASSWORD:-api_ro_dev}
+    volumes:
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../dashboards/grafana:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    mem_limit: 384m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health | grep -q ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
   # Generic Spark job runner:  docker compose --profile jobs run --rm spark-job <job> [args]
   spark-job:
     image: mobility-spark:3.5.3
@@ -183,6 +280,8 @@ services:
       - ../:/opt/app:ro
 
 volumes:
+  prometheus-data:
+  grafana-data:
   postgres-data:
   kafka-1-data:
   kafka-2-data:

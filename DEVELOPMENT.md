@@ -95,7 +95,8 @@ flowchart LR
 - [x] Phase 3: Silver: validation, quarantine, dedup, DQ score/report (verified against independent oracle, section 5)
 - [x] Phase 4: Gold windows (tumbling+sliding, watermark) -> Delta MERGE + Postgres upsert; live concurrent run (section 5)
 - [x] Phase 5: FastAPI service over Gold (11 endpoints), health/readiness, JSON logs, Prometheus metrics (section 5)
-- [ ] Phase 6: Prometheus + Grafana, Kafka lag exporter, dashboards
+- [x] Phase 6: Prometheus + Grafana + kafka-exporter + app metrics, 3 provisioned dashboards, 8 alerts (section 5, docs/observability.md)
+- [ ] Phase 7: reliability drills (broker kill, Spark kill, checkpoint recovery, graceful shutdown)
 
 ## 5. Test results
 
@@ -146,6 +147,19 @@ flowchart LR
 3. Docker builds could not reach PyPI (read timeouts, twice, even with retries; host pip too). API deps are now vendored for linux/arm64 with `uv` (`make api-vendor`, `api/vendor/` git-ignored), so the image builds with no PyPI access.
 4. My e2e script had a syntax error and one test expectation was wrong (49-char payload correctly rejected by `max_length=40`); fixed, not worked around.
 
+**Phase 6 (executed, passing):** details in `docs/observability.md`.
+- Added: Prometheus (5 s scrape), Grafana (provisioned datasources + 3 dashboards generated from `dashboards/build_dashboards.py`: 39 panels / 47 queries), kafka-exporter, Spark driver metrics (`spark_jobs/metrics.py`, ports 8001-8003), producer metrics (:8010), API metrics (Phase 5), 8 alert rules (`promtool check rules`: 8 rules OK). Streaming jobs are now long-running compose services (`--profile streaming`, `restart: on-failure`).
+- `make test-spark`: **43 passed** (5 new metrics tests: lag math for Kafka and Delta sources, processed-offset export, Silver-series init, progress export).
+- **Clean-state live run (`make obs-demo`) PASS, 65 checks:** Prometheus targets up; Grafana datasources healthy; **every one of the 47 panel queries executed through Grafana's own `/api/ds/query` returns data**; ground truth: producer sent 102,000 = acked (acks=all), failed 0, Kafka raw-topic end offsets 102,000, Bronze input rows 102,000, Silver received 102,000 with valid+quarantined+duplicate = 102,000, DLQ topic offsets = 99 diverted events, true Kafka lag drained to 0, Delta lag 0, latency reported. Only the Silver job exports Silver series.
+- Alert proof: stopping the API -> `TargetDown` firing after 31 s ("api is down"); cleared 7 s after restart. `WatermarkDroppingData` fired by itself during the late-data replay.
+- Measured under the 1000x burst (102k events, 815 ev/s offered, single-driver `local[2]` Spark in an 8 GB VM): peak Spark processedRowsPerSecond Bronze ~2.2k, Silver ~1.0k, Gold queries 1.1k-5.3k; Silver micro-batches up to 56 s against a 5 s trigger; producer->Silver latency up to ~111 s at the worst moment (82-111 s across runs). Sustainable throughput of this configuration is therefore roughly **1k events/s**, bounded by Silver (MERGE + decode + rules), not by Kafka or the producer. This is a measurement, not a benchmark; Phase 10 will do controlled runs.
+
+**Defects found in my own Phase 6 work (all fixed, with tests):**
+1. **Lag metric was wrong.** `spark_kafka_lag_records` (Spark's latestOffset - endOffset) stays ~0 because latestOffset is fixed at planning time, even while Silver took 56 s per batch. True lag is now broker log-end offset (kafka-exporter) minus `spark_kafka_processed_offset_sum`; shown rising to 76,935 records during a 150k burst and draining to 0 while the old gauge read 0. Dashboard panels and two alerts rewritten.
+2. Checker read the first series of a metric that three jobs exported (Silver outcome counters pre-created at import in Bronze/Gold too) and produced a vacuous `0 == 0` pass; fixed with `sum()` + non-vacuity guard, and the pre-init moved into Silver only. I also briefly wrote a check ending in `or True` (cannot fail) and removed it in favour of a real unit test.
+3. Producer metrics vanish from instant queries once the short-lived host process exits (staleness); final counters are read with `max_over_time`.
+4. My first alert test looped on "any firing alert" (an unrelated real alert was already firing) and proved only `pending`; redone against `TargetDown` specifically.
+
 ## 6. Known limitations (so far)
 
 - 8 GB Docker VM: Airflow and Superset run under separate profiles, not alongside the full streaming stack.
@@ -176,3 +190,8 @@ flowchart LR
 - `api_ro` password is a dev default (`api_ro_dev`) set in `init.sql`; rotate/override in any real deployment. `init.sql` role/grants apply to an existing database via `make pg-apply`.
 - DQ metrics/reports are in Delta only; they are not served through the API yet.
 - Defaults for omitted time ranges are anchored on the newest data in the table, not wall-clock (replayed history); documented in the endpoint behaviour, covered by a test.
+- Observability: no Alertmanager (alerts are visible in Prometheus/Grafana only); Grafana admin password is `admin` by default; no Postgres/MinIO/node exporters or container (cAdvisor) metrics; dashboards' Kafka panels cover topics matching `trips\..*` only.
+- Memory: the 3 streaming drivers + monitoring + core stack run inside the 8 GB Docker VM only with Kafka UI stopped (`make streaming-up` does that); Gold peaked at 1.79 of its 2 GiB limit in one run, an OOM kill is possible on larger data.
+- Latency/throughput numbers above come from one machine and one run each; no variance estimate.
+- No screenshots were captured (no image renderer / browser driven); instructions are in `docs/observability.md`.
+- Producer metrics only exist while a replay runs; the producer is not containerised.

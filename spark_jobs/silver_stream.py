@@ -29,6 +29,7 @@ from pyspark.sql.types import (LongType, MapType, StringType, StructField, Struc
 from spark_jobs.common import (BRONZE_PATH, CHECKPOINT_ROOT, DQ_METRICS_PATH, QUARANTINE_PATH, SILVER_PATH,
                                TRIP_SCHEMA_PATH, build_spark, wait_for_delta_table)
 from spark_jobs.dq_rules import apply_rules, decode_bronze
+from spark_jobs.metrics import init_silver_series, record_silver_batch, start_metrics
 
 SILVER_COLUMNS = [
     "event_id", "taxi_type", "event_time", "dropoff_ts", "trip_duration_seconds", "ingestion_time",
@@ -102,7 +103,11 @@ def process_batch(spark: SparkSession, batch_df: DataFrame, batch_id: int, paths
         # 4. DQ metrics
         totals = checked.agg(
             F.count("*").alias("n"), F.sum(F.col("undecodable").cast("long")).alias("undecodable"),
-            F.sum((F.size("errors") > 0).cast("long")).alias("quarantined")).first()
+            F.sum((F.size("errors") > 0).cast("long")).alias("quarantined"),
+            # end-to-end latency: producer emit time -> now (decodable rows only)
+            F.avg(F.unix_timestamp(F.current_timestamp()) - F.col("ingestion_time").cast("long")).alias("lat_avg"),
+            F.max(F.unix_timestamp(F.current_timestamp()) - F.col("ingestion_time").cast("long")).alias("lat_max")
+            ).first()
         n_rows, n_undec, n_quar = int(totals["n"] or 0), int(totals["undecodable"] or 0), int(totals["quarantined"] or 0)
         rule_counts = {r["rule"]: int(r["n"]) for r in
                        checked.select(F.explode(F.concat("errors", "warnings")).alias("rule"))
@@ -112,6 +117,8 @@ def process_batch(spark: SparkSession, batch_df: DataFrame, batch_id: int, paths
             "batch_id": batch_id, "bronze_rows": n_rows, "undecodable": n_undec, "quarantined": n_quar,
             "valid_rows": n_valid, "dup_in_batch": n_valid - n_unique, "dup_vs_silver": n_unique - inserted,
             "silver_inserted": inserted, "avg_dq_score": avg_score, "rule_counts": rule_counts,
+            "latency_avg_s": float(totals["lat_avg"]) if totals["lat_avg"] is not None else None,
+            "latency_max_s": float(totals["lat_max"]) if totals["lat_max"] is not None else None,
         }
         row = (batch_id, None, n_rows, n_undec, n_quar, n_valid, metrics["dup_in_batch"],
                metrics["dup_vs_silver"], inserted, avg_score, rule_counts)
@@ -129,6 +136,8 @@ def main() -> None:
     args = ap.parse_args()
 
     spark = build_spark("silver-stream")
+    listener = start_metrics(spark)
+    init_silver_series()
     schema_json = Path(TRIP_SCHEMA_PATH).read_text()
     paths = Paths()
     wait_for_delta_table(spark, BRONZE_PATH)
@@ -137,6 +146,7 @@ def main() -> None:
 
     def handle(df: DataFrame, batch_id: int) -> None:
         m = process_batch(spark, df, batch_id, paths, schema_json)
+        record_silver_batch(m)
         print("SILVER_BATCH " + str(m), flush=True)
 
     writer = (source.writeStream.foreachBatch(handle)
@@ -146,7 +156,11 @@ def main() -> None:
     query = writer.start()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: query.stop())
-    query.awaitTermination()
+    try:
+        query.awaitTermination()
+    finally:
+        if listener is not None:
+            spark.streams.removeListener(listener)
 
 
 if __name__ == "__main__":

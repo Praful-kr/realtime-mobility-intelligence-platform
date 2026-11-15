@@ -1,0 +1,42 @@
+groups:
+  - name: pipeline
+    rules:
+      - alert: TargetDown
+        expr: up{job!="producer"} == 0
+        for: 30s
+        labels: {severity: critical}
+        annotations: {summary: "{{ $labels.job }} is down"}
+      - alert: KafkaUnderReplicatedPartitions
+        expr: sum(kafka_topic_partition_under_replicated_partition) > 0
+        for: 30s
+        labels: {severity: critical}
+        annotations: {summary: "{{ $value }} partitions under-replicated (broker down?)"}
+      - alert: KafkaBrokerMissing
+        expr: kafka_brokers < 3
+        for: 30s
+        labels: {severity: critical}
+        annotations: {summary: "only {{ $value }} of 3 Kafka brokers visible"}
+      - alert: StreamingConsumerLagHigh
+        expr: sum(kafka_topic_partition_current_offset{topic="trips.raw.v1"}) - sum(spark_kafka_processed_offset_sum{topic="trips.raw.v1"}) > 100000
+        for: 1m
+        labels: {severity: warning}
+        annotations: {summary: "Bronze is {{ $value }} records behind Kafka"}
+      - alert: StreamingJobStalled
+        expr: ((time() - max(spark_last_batch_timestamp_seconds{query="bronze-trips-raw"})) > 120) and ((sum(kafka_topic_partition_current_offset{topic="trips.raw.v1"}) - sum(spark_kafka_processed_offset_sum{topic="trips.raw.v1"})) > 0)
+        for: 1m
+        labels: {severity: critical}
+        annotations: {summary: "Bronze has lag but has not completed a batch for 2 minutes"}
+      - alert: DeadLetterQueueGrowing
+        expr: sum(increase(kafka_topic_partition_current_offset{topic="trips.dlq.v1"}[5m])) > 100
+        for: 1m
+        labels: {severity: warning}
+        annotations: {summary: "{{ $value }} events diverted to the DLQ in 5 minutes"}
+      - alert: WatermarkDroppingData
+        expr: sum by (query) (increase(spark_dropped_by_watermark_groups_total[10m])) > 0
+        labels: {severity: warning}
+        annotations: {summary: "{{ $labels.query }} dropped late data beyond the watermark"}
+      - alert: ApiErrorRateHigh
+        expr: sum(rate(api_http_requests_total{status=~"5.."}[2m])) / sum(rate(api_http_requests_total[2m])) > 0.05
+        for: 1m
+        labels: {severity: warning}
+        annotations: {summary: "API 5xx ratio {{ $value | humanizePercentage }}"}
