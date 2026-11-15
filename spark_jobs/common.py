@@ -33,3 +33,24 @@ def build_spark(app_name: str) -> SparkSession:
     )
     spark.sparkContext.setLogLevel(os.getenv("SPARK_LOG_LEVEL", "WARN"))
     return spark
+
+
+def wait_for_delta_table(spark: SparkSession, path: str, poll_seconds: int = 5, timeout_seconds: int = 0) -> None:
+    """Block until an upstream Delta table exists AND has a schema. Streaming-reading a table that its
+    producer has not written yet fails with DELTA_SCHEMA_NOT_SET; on a cold start the layers come up in
+    any order, so each downstream job waits for its source (timeout 0 = wait forever)."""
+    import time
+
+    from delta.tables import DeltaTable
+    waited = 0
+    while True:
+        try:
+            if DeltaTable.isDeltaTable(spark, path) and spark.read.format("delta").load(path).schema.fields:
+                return
+        except Exception:  # noqa: BLE001 - table mid-creation; retry
+            pass
+        if timeout_seconds and waited >= timeout_seconds:
+            raise TimeoutError(f"upstream table not available: {path}")
+        print(f"WAITING_FOR_UPSTREAM {path}", flush=True)
+        time.sleep(poll_seconds)
+        waited += poll_seconds

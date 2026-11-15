@@ -93,7 +93,8 @@ flowchart LR
 - [x] Phase 1: scaffold + core stack (verified 2026-11-15, see section 5)
 - [x] Phase 2: vertical slice producer -> Kafka -> Bronze Delta on MinIO (verified, section 5)
 - [x] Phase 3: Silver: validation, quarantine, dedup, DQ score/report (verified against independent oracle, section 5)
-- [ ] Phase 4: Gold windows + Postgres serving sink
+- [x] Phase 4: Gold windows (tumbling+sliding, watermark) -> Delta MERGE + Postgres upsert; live concurrent run (section 5)
+- [ ] Phase 5: FastAPI + health/readiness
 
 ## 5. Test results
 
@@ -120,6 +121,18 @@ flowchart LR
 - DQ report generated from the tables: `docs/dq_report.md` (received = quarantined + dup-dropped + inserted reconciles; mean Silver DQ score 0.9906; 92.05% of Silver rows have zero warnings).
 - Cross-batch dedup on the live pipeline: replayed the first 5,000 events (same ids) as batch 1 -> 4,922 dropped vs Silver, 4 inserted. The 4 are exactly the events the injector had diverted to the DLQ in the first run (positions 1008/2017/3026/4035), i.e. explained, not noise. Re-running Silver on the drained checkpoint processed 0 batches.
 
+**Phase 4 (executed, passing):**
+- `make test-spark`: **38 tests** (was 28). New: each Gold aggregate vs hand-computed values (tumbling, 15m/5m sliding = 3 windows per event, pickup+dropoff zone union with borough join, hourly, 4 outlier types), handler idempotent on batch replay, Spark spec columns == Postgres DDL columns, upsert SQL shape, and the **late-data scenario on real job code and Delta tables** (3 commits: watermark advances to ~12:00; a 2h15m-late event is dropped and the evicted window is untouched; a 20-min-late event within the 30-min watermark is merged).
+- **E2E strict (`bash infrastructure/scripts/e2e_gold.sh`)**, 300k replayed rows with injected dup/poison/null faults, availableNow Bronze->Silver->Gold: `GOLD_RESULT PASS` — Delta == Postgres == batch recompute from Silver for all 5 tables (0 missing/extra/mismatch). **Independent oracle (plain Python from the raw parquet, no Spark/Silver) PASS** on 10 measures, incl. 8,289 minute rows, 129,708 zone-window rows; sum of per-minute trips = 295,419 = distinct valid events.
+- **Live concurrent run (`bash infrastructure/scripts/live_demo.sh`)**: Bronze, Silver, Gold as three continuous 5 s-trigger Spark drivers while the producer replays 102,000 events at 1000x (125 s, ~815 ev/s) with injected late (200, 3000 events late), duplicate (1,999), poison (100) and null-pickup (99) events, watermark 10 min. Producer sent=acked=102,000. Each driver ~1.2-1.4 GiB of its 2 GiB limit; whole stack fit in the 8 GB VM. Silver oracle PASS on this run too (Bronze 102,000 rows). Gold `--live` verification PASS: Delta == Postgres exactly, no window over-counted or invented, watermark loss visible: sliding 17 events lost / 17 groups dropped, hourly 5 events lost / 2 groups dropped, minute/zone/anomaly 0.
+- Serving views work: `gold.v_demand_by_hour_of_day`, `gold.v_demand_anomalies` (|z|>3 vs trailing 60 min; flags the real New-Year-midnight spike, z=40), top pickup zone JFK (20,848 trips in sample). Postgres on host port 5433.
+
+**Bugs/wrong assumptions found while building Phase 4 (all fixed or documented):**
+1. *Wrong claim corrected:* I assumed `numRowsDroppedByWatermark` counts dropped events. The live run showed hourly lost 5 events but Spark reported 2. Confirmed by a pinned test: the counter counts **aggregated groups** (lower bound). Exact loss is Silver minus Gold; verifier now requires loss to be *visible* (deficit>0 <=> dropped>0, dropped<=deficit), not equal.
+2. Silver and Gold crashed on cold start (`DELTA_SCHEMA_NOT_SET`): streaming from a Delta table whose producer had not written yet. Fixed with `wait_for_delta_table`; the first live attempt exposed it, the second run proves it.
+3. py4j errors at Gold shutdown (listener torn down mid-callback): listener removed and Spark stopped in `finally`.
+4. Live-demo script hung forever when drivers died; now fails fast with logs.
+
 ## 6. Known limitations (so far)
 
 - 8 GB Docker VM: Airflow and Superset run under separate profiles, not alongside the full streaming stack.
@@ -138,3 +151,11 @@ flowchart LR
 - Silver MERGE creates small files per batch/partition; compaction (`OPTIMIZE`) is planned for the Airflow phase and not yet implemented.
 - The E2E run processed the 306k events as ONE micro-batch (`availableNow`); multi-batch behaviour was shown by the replay run and the unit tests, but the continuous trigger and mid-batch crash recovery are still undemonstrated (Phase 7).
 - `reset-data` is destructive (topics, lakehouse, checkpoints); local dev only.
+- **Late data beyond the watermark is dropped from the streaming Gold tables** (by design; bounded state). It is flagged (metric + verifier) but the repair path, a batch recompute of affected windows, is planned for the Airflow phase and **not implemented yet**.
+- Spark's watermark-drop counter is a lower bound (groups, not events), see Phase 4 findings.
+- Graceful shutdown of PySpark drivers is NOT demonstrated: `docker stop` signals the JVM (spark-submit), and the Python SIGTERM handlers in the jobs may never run. Phase 7 must test this rather than assume it.
+- Live demo drains by *quiescence* (Postgres total stable for 3 polls), not by an exact offset comparison.
+- Demand anomalies are a SQL z-score view (not streaming state); trip-level outliers are streaming. The 300k-row sample ends mid-minute, so the final window is partial (shows up as a spurious negative anomaly).
+- Gold Delta tables are small-file heavy (many upsert commits); `OPTIMIZE`/`VACUUM` still pending (Airflow phase). Gold tables use no Z-order.
+- Idempotent Gold upserts are proven by replaying a batch, not by killing a driver mid-batch (Phase 7).
+- Postgres credentials in `.env` are dev defaults.

@@ -15,5 +15,5 @@ RUN set -eux; cd /opt/spark/jars; \
     com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar ; do \
     curl -fsSL -O "$MVN/$u"; done
 RUN pip install --no-cache-dir --no-deps delta-spark==3.2.1 importlib_metadata zipp prometheus-client==0.21.0 && ls /opt/spark/jars | grep -c -E "delta|kafka|hadoop-aws|aws-java|avro"
-RUN pip install --no-cache-dir --default-timeout=120 --retries 8 pytest fastavro
+RUN pip install --no-cache-dir --default-timeout=120 --retries 8 pytest fastavro psycopg2-binary==2.9.9
 USER spark

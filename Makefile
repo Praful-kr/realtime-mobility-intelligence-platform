@@ -60,3 +60,17 @@ reset-data:   ## DESTRUCTIVE: deletes Kafka topics, lakehouse and checkpoints (l
 
 e2e-silver:
 	bash infrastructure/scripts/e2e_silver.sh
+
+# ---- Phase 4 Gold ----
+.PHONY: gold verify-gold pg-apply psql
+gold:      ## TRIGGER=availableNow|<seconds>; WATERMARK="30 minutes"
+	$(SPARK_JOB) gold_stream --trigger $(or $(TRIGGER),availableNow) --watermark "$(or $(WATERMARK),30 minutes)"
+
+verify-gold:   ## add LIVE=1 for live/late-data mode
+	$(SPARK_JOB) gold_verify $(if $(LIVE),--live) 2>&1 | grep -E "GOLD_RESULT|GOLD_REPORT"
+
+pg-apply:  ## re-apply the (idempotent) serving DDL to a running Postgres
+	docker exec -i mobility-postgres-1 psql -U mobility -d mobility -v ON_ERROR_STOP=1 < infrastructure/postgres/init.sql
+
+psql:
+	docker exec -it mobility-postgres-1 psql -U mobility -d mobility

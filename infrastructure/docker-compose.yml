@@ -119,6 +119,23 @@ services:
       retries: 10
       start_period: 10s
 
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    ports: ["5433:5432"]   # 5433 on the host to avoid clashing with a local Postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
   # Generic Spark job runner:  docker compose --profile jobs run --rm spark-job <job> [args]
   spark-job:
     image: mobility-spark:3.5.3
@@ -126,6 +143,7 @@ services:
     depends_on:
       minio: {condition: service_healthy}
       kafka-1: {condition: service_healthy}
+      postgres: {condition: service_healthy}
     entrypoint: ["bash", "/opt/app/infrastructure/spark/submit.sh"]
     mem_limit: 2g
     environment:
@@ -133,10 +151,16 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
       KAFKA_BOOTSTRAP: kafka-1:9092,kafka-2:9092,kafka-3:9092
       S3_ENDPOINT: http://minio:9000
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - ../:/opt/app:ro
 
 volumes:
+  postgres-data:
   kafka-1-data:
   kafka-2-data:
   kafka-3-data:

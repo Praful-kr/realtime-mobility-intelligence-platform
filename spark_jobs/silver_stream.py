@@ -27,7 +27,7 @@ from pyspark.sql.types import (LongType, MapType, StringType, StructField, Struc
                                DoubleType)
 
 from spark_jobs.common import (BRONZE_PATH, CHECKPOINT_ROOT, DQ_METRICS_PATH, QUARANTINE_PATH, SILVER_PATH,
-                               TRIP_SCHEMA_PATH, build_spark)
+                               TRIP_SCHEMA_PATH, build_spark, wait_for_delta_table)
 from spark_jobs.dq_rules import apply_rules, decode_bronze
 
 SILVER_COLUMNS = [
@@ -131,6 +131,7 @@ def main() -> None:
     spark = build_spark("silver-stream")
     schema_json = Path(TRIP_SCHEMA_PATH).read_text()
     paths = Paths()
+    wait_for_delta_table(spark, BRONZE_PATH)
     source = (spark.readStream.format("delta").option("maxFilesPerTrigger", args.max_files_per_trigger)
               .load(BRONZE_PATH))
 

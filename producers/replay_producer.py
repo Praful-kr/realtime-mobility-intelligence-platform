@@ -63,7 +63,7 @@ class ReplayProducer:
         self.args = args
         self.stop = False
         self.sent = self.acked = self.failed = self.dlq = self.backpressure_events = 0
-        self.injected_dups = self.injected_poison = self.injected_null_pickup = 0
+        self.injected_dups = self.injected_poison = self.injected_null_pickup = self.injected_late = 0
         sr = SchemaRegistryClient({"url": self.s.schema_registry_url})
         self.serializer = AvroSerializer(sr, SCHEMA_PATH.read_text(), conf={"auto.register.schemas": True})
         self.producer = Producer({
@@ -115,6 +115,8 @@ class ReplayProducer:
         clock = ReplayClock(self.args.speed, self.args.window_start, self.args.window_end, time.monotonic)
         t0 = last_report = time.monotonic()
         # pace by wall clock only after the first in-window event, so setup time is excluded
+        a = self.args
+        deferred: list = []   # (release_pos, original_pos, row) for injected late arrivals
         for offset in range(0, total, 20000):
             if self.stop:
                 break
@@ -125,13 +127,25 @@ class ReplayProducer:
                 delay = clock.delay_for(row["pickup_ts"]) if row["pickup_ts"] else 0.0
                 if delay > 0:
                     time.sleep(delay)
-                self._emit(row, pos)
+                if a.inject_late_every and (pos + 1) % a.inject_late_every == 0:
+                    # late arrival: same content, emitted `late_by_events` positions later (event time unchanged)
+                    deferred.append((pos + a.late_by_events, pos, row))
+                    self.injected_late += 1
+                else:
+                    self._emit(row, pos)
+                if deferred:
+                    due = [d for d in deferred if d[0] <= pos]
+                    deferred[:] = [d for d in deferred if d[0] > pos]
+                    for _, orig_pos, late_row in due:
+                        self._emit(late_row, orig_pos)
                 now = time.monotonic()
                 if now - last_report >= 5:
                     last_report = now
                     log.info("progress", extra={"sent": self.sent, "acked": self.acked, "failed": self.failed,
                                                 "dlq": self.dlq, "rate_per_s": round(self.sent / (now - t0)),
                                                 "backpressure_events": self.backpressure_events})
+        for _, orig_pos, late_row in deferred:   # nothing may be silently lost at end of replay
+            self._emit(late_row, orig_pos)
         remaining = self.producer.flush(60)
         elapsed = time.monotonic() - t0
         log.info("replay finished", extra={"sent": self.sent, "acked": self.acked, "failed": self.failed,
@@ -140,6 +154,7 @@ class ReplayProducer:
                                            "backpressure_events": self.backpressure_events,
                                            "injected_dups": self.injected_dups,
                                            "injected_poison": self.injected_poison,
+                                           "injected_late": self.injected_late,
                                            "injected_null_pickup": self.injected_null_pickup,
                                            "interrupted": self.stop})
         return 0 if (remaining == 0 and self.failed == 0) else 1
@@ -188,6 +203,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--window-start", type=datetime.fromisoformat, default=datetime(2024, 1, 1))
     p.add_argument("--window-end", type=datetime.fromisoformat, default=datetime(2024, 2, 1))
     p.add_argument("--max-queue", type=int, default=100000)
+    p.add_argument("--inject-late-every", type=int, default=0, help="delay every Nth event (late arrival)")
+    p.add_argument("--late-by-events", type=int, default=3000, help="how many events later a late event is sent")
     p.add_argument("--inject-dup-every", type=int, default=0, help="re-send every Nth event (duplicate)")
     p.add_argument("--inject-poison-every", type=int, default=0, help="after every Nth event send garbage bytes")
     p.add_argument("--inject-null-pickup-every", type=int, default=0,
