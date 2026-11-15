@@ -1,59 +1,16 @@
 # Real-Time Mobility Intelligence Platform
 
-A streaming data platform built on real NYC taxi trips: **Kafka → Spark Structured Streaming → Delta Lake (Bronze/Silver/Gold) on MinIO → Postgres → FastAPI**, with Prometheus/Grafana observability and a set of **scripted failure drills that verify the results against independent oracles**.
+A streaming data platform built on real NYC taxi trips. Trips are replayed into Kafka, cleaned and aggregated with Spark Structured Streaming into a Delta Lake (Bronze, Silver, Gold), served from Postgres through a FastAPI service, and monitored with Prometheus and Grafana.
 
-The emphasis is on correctness you can check, not on the number of tools: every claim below links to a test, a drill, or a measured number. Things that were *not* built or *not* proven are listed in [Limitations](#limitations).
+The focus is on results you can check. Pipeline output is compared with independent oracles (plain Python that does not share code with Spark), and failures are injected on purpose to see whether the results stay correct.
 
 ![Pipeline dashboard](docs/screenshots/grafana-pipeline-overview.png)
 
-## Contents
-[Architecture](#architecture) · [Data flow](#data-flow) · [Design decisions](#design-decisions) · [Quick start](#quick-start) · [What was verified](#what-was-verified) · [Reliability drills](#reliability-drills) · [Measured performance](#measured-performance) · [Repository layout](#repository-layout) · [Limitations](#limitations) · [Troubleshooting](#troubleshooting)
+**Contents:** [Data flow](#1-data-flow) · [System architecture](#2-system-architecture) · [Tech stack and why](#3-tech-stack-and-why) · [Quick start](#4-quick-start) · [What was verified](#5-what-was-verified) · [Screenshots](#screenshots) · [Limitations](#6-limitations) · [Repository layout](#7-repository-layout)
 
-## Architecture
+---
 
-```mermaid
-flowchart LR
-  subgraph SRC[Sources]
-    TLC[NYC TLC parquet<br/>yellow + green, Jan 2024]
-  end
-  subgraph ING[Ingestion]
-    P[Replay producer<br/>1x / 10x / 100x / unthrottled<br/>idempotent, acks=all, backpressure]
-  end
-  subgraph KAFKA[Kafka KRaft, 3 brokers, RF=3, min ISR 2]
-    RAW[(trips.raw.v1<br/>6 partitions, Avro)]
-    DLQ[(trips.dlq.v1)]
-    SR[Schema Registry<br/>BACKWARD compat]
-  end
-  subgraph SPARK[Spark Structured Streaming - 3 drivers]
-    B[Bronze job<br/>raw bytes + Kafka coordinates]
-    S[Silver job<br/>decode, DQ rules, dedup]
-    G[Gold job<br/>event-time windows, watermark]
-  end
-  subgraph LAKE[Delta Lake on MinIO]
-    DB[(Bronze)]
-    DS[(Silver)]
-    DQT[(Quarantine)]
-    DG[(Gold x5)]
-  end
-  PG[(Postgres<br/>gold schema, read-only role)]
-  API[FastAPI<br/>11 endpoints]
-  subgraph OBS[Observability]
-    PR[Prometheus] --> GF[Grafana + 8 alert rules]
-  end
-  TLC --> P --> RAW
-  P -. unserialisable row .-> DLQ
-  P -. schema id .-> SR
-  RAW --> B --> DB --> S
-  S --> DS --> G
-  S --> DQT
-  G --> DG
-  G -->|ON CONFLICT upsert| PG --> API
-  KAFKA -. lag / ISR .-> PR
-  SPARK -. query progress .-> PR
-  API -. request metrics .-> PR
-```
-
-## Data flow
+## 1. Data flow
 
 ```mermaid
 sequenceDiagram
@@ -63,166 +20,157 @@ sequenceDiagram
   participant S as Silver
   participant G as Gold
   participant PG as Postgres
-  P->>K: Avro event (key=event_id), acks=all, idempotent
-  Note over P,K: row that cannot be serialised goes to trips.dlq.v1
-  K->>B: micro-batch (maxOffsetsPerTrigger caps batch size)
-  B->>B: append raw bytes and Kafka coordinates. txnAppId and txnVersion=batchId make a replayed batch a no-op
-  B->>S: stream the Delta table
-  S->>S: decode Avro, apply rule catalog
-  S->>S: ERROR rule sends the row to Quarantine with raw bytes kept. WARN rule lowers the DQ score by 0.1
-  S->>S: insert-only MERGE on event_id (drops in-batch and cross-batch duplicates)
+  P->>K: Avro event keyed by event_id (idempotent, acks=all)
+  Note over P,K: A row that cannot be serialised goes to the DLQ topic
+  K->>B: micro-batch, size capped by maxOffsetsPerTrigger
+  B->>B: append raw bytes plus Kafka coordinates, replayed batches are skipped
+  B->>S: stream the Bronze table
+  S->>S: decode Avro and apply the data-quality rules
+  S->>S: bad rows go to Quarantine, duplicates are dropped
   S->>G: stream the Silver table
-  G->>G: event-time windows with a 10 min watermark. Events later than that are dropped and counted
-  G->>G: MERGE into Delta Gold (5 tables)
-  G->>PG: upsert on the window key (INSERT ON CONFLICT DO UPDATE)
+  G->>G: event-time windows with a 10 min watermark
+  G->>PG: upsert on the window key
 ```
 
-| Layer | Content | Why it exists |
+| Layer | What it holds | Why |
 |---|---|---|
-| **Bronze** | Exact Kafka bytes + topic/partition/offset/timestamp | Immutable, replayable source of truth; Silver/Gold can be rebuilt from it |
-| **Silver** | Decoded, validated, de-duplicated trips with a DQ score | One trusted row per event; rejects are kept, not discarded |
-| **Quarantine** | Rejected rows with the *reason* and the original bytes | Nothing is silently dropped; reprocessable after a rule fix |
-| **Gold** | `trips_per_minute`, `demand_sliding_15m`, `zone_demand_5m`, `hourly_demand`, `anomaly_counts` | Business aggregates, written to Delta **and** Postgres |
+| **Bronze** | The exact Kafka bytes plus topic, partition and offset | An immutable source of truth. Silver and Gold can be rebuilt from it |
+| **Silver** | Decoded, validated, de-duplicated trips with a quality score | One trusted row per event |
+| **Quarantine** | Rejected rows with the reason and the original bytes | Nothing is silently dropped |
+| **Gold** | Five aggregates: trips per minute, 15 min sliding demand, zone demand, hourly demand, anomaly counts | Business metrics, written to Delta and to Postgres |
 
-## Design decisions
+## 2. System architecture
 
-| Decision | Choice | Trade-off accepted |
+```mermaid
+flowchart LR
+  TLC[NYC TLC parquet] --> P[Replay producer<br/>1x, 10x, 100x or max speed]
+  subgraph KAFKA[Kafka KRaft, 3 brokers, RF=3]
+    RAW[(trips.raw.v1)]
+    DLQ[(trips.dlq.v1)]
+    SR[Schema Registry]
+  end
+  P --> RAW
+  P -.-> DLQ
+  subgraph SPARK[Spark Structured Streaming]
+    B[Bronze job] --> S[Silver job] --> G[Gold job]
+  end
+  RAW --> B
+  subgraph LAKE[Delta Lake on MinIO]
+    DB[(Bronze)]
+    DS[(Silver)]
+    DQT[(Quarantine)]
+    DG[(Gold)]
+  end
+  B --> DB
+  S --> DS
+  S --> DQT
+  G --> DG
+  G --> PG[(Postgres)] --> API[FastAPI]
+  KAFKA -.-> PR[Prometheus]
+  SPARK -.-> PR
+  API -.-> PR
+  PR --> GF[Grafana and alerts]
+```
+
+Key design choices:
+
+- **Effectively-once per sink, not end-to-end exactly-once.** Kafka delivers at-least-once, and every sink is idempotent: Delta transaction IDs for Bronze, `MERGE` on `event_id` for Silver, upserts for Gold and Postgres. No transaction spans Kafka, Delta and Postgres, so I do not claim more. The failure drills check this instead of asserting it.
+- **One Spark job per layer.** A problem in one layer does not stop the others, and each can be restarted on its own.
+- **One writer per Delta table.** Delta on S3-style storage has no atomic rename, so concurrent writers are unsafe.
+- **Late data:** events later than the watermark are dropped from streaming Gold and counted in metrics. A batch job to repair them is not built.
+
+## 3. Tech stack and why
+
+| Technology | Role | Why this one |
 |---|---|---|
-| Delivery semantics | At-least-once source + **idempotent sinks** = effectively-once *per sink* | No cross-system transaction exists, so this is never claimed as end-to-end exactly-once. It is demonstrated by killing writers and comparing against oracles |
-| Bronze idempotence | Delta `txnAppId` + `txnVersion = batchId` in `foreachBatch` | Only holds while the checkpoint exists. Deleting a checkpoint without clearing the table would re-append |
-| Delta on S3A (MinIO) | Exactly one writer per table | S3A has no atomic rename. Scaling out means more partitions/tables, not more writers on one table |
-| Dedup | Insert-only `MERGE` on `event_id` into Silver | Exact (checked against the oracle), but the merge cost grows with Silver size. A state-based dedup bounded by the watermark would be cheaper; it was not built or compared |
-| Late data | 10 min watermark, bounded state; later events are dropped from streaming Gold and *counted* | Repair is a batch recompute of the affected windows. That job is **not implemented** |
-| Schema | Avro + Schema Registry (BACKWARD), 5-byte wire header stripped for `from_avro` | Needs explicit header handling in Spark |
-| Partition key | `event_id` | Uniform spread, but no per-zone ordering (keying by zone gives hot partitions: JFK/LGA) |
-| Kafka | 3 KRaft brokers, RF=3, min ISR 2, `acks=all` | ~1.5 GB of the 8 GB VM, but it is the only way to demonstrate a broker failure |
-| Spark | Three separate `local[2]` drivers, one per layer | A failure in one layer does not stop the others. Costs ~1.3-1.8 GB each, and throughput is bounded (~1k events/s for Silver) |
-| Serving | Postgres upsert + read-only DB role + bounded connection wait | Not a real OLAP store; fine at this scale |
+| **Kafka** (KRaft, 3 brokers, RF=3, min ISR 2) | Event log | A real cluster is the only way to demonstrate a broker failure. `acks=all` plus an idempotent producer prevents loss and duplicates on send |
+| **Avro + Schema Registry** | Event format | Enforces a schema and checks compatibility (BACKWARD) before a producer can change it |
+| **Spark Structured Streaming** (PySpark) | Processing | Event-time windows, watermarks, checkpointing and built-in Delta and Kafka connectors |
+| **Delta Lake** | Table format | ACID commits, `MERGE` for dedup and upserts, and transaction IDs that make retried writes safe |
+| **MinIO** | Object storage | S3-compatible storage that runs locally |
+| **Postgres** | Serving store | Simple upserts and indexed reads for the API, with a read-only role for the service |
+| **FastAPI** | API | Typed, validated endpoints with automatic OpenAPI docs, health and readiness checks, and JSON logs |
+| **Prometheus + Grafana** | Observability | Metrics, 8 alert rules, and dashboards generated from code so they stay reproducible |
+| **Docker Compose** | Environment | One command brings up the stack. Profiles keep it inside an 8 GB Docker VM |
+| **pytest + GitHub Actions** | Testing and CI | Unit, API, Spark and oracle tests, and a CI pipeline that runs them |
 
-## Quick start
+## 4. Quick start
 
-Requirements: Docker (VM with **8 GB** RAM, 5 CPUs), `uv`, Python 3.12, `curl`. Tested on Apple silicon (arm64).
+Needs Docker (VM with 8 GB RAM and 5 CPUs), `uv`, Python 3.12 and `curl`. Tested on Apple silicon.
 
 ```bash
-cp .env.example .env                 # local-dev defaults only
+cp .env.example .env                       # local-dev defaults only
 uv venv --python 3.12 && uv pip install -r requirements.txt
-make data                            # NYC TLC Jan-2024 yellow/green + zone lookup (~50 MB)
-make spark-image                     # Spark 3.5.3 + Delta 3.2.1 + Kafka/Avro/S3A jars
-make up                              # Kafka x3, Schema Registry, Kafka UI, MinIO, Postgres
-make topics                          # trips.raw.v1 (6 partitions, RF=3), trips.dlq.v1
-make monitoring-up                   # kafka-exporter, Prometheus, Grafana, API
-make streaming-up                    # Bronze/Silver/Gold drivers (stops Kafka UI to save RAM)
-
-make produce SPEED=0 LIMIT=100000    # SPEED=1 real time, 10, 100; 0 = as fast as possible
+make data                                  # NYC TLC Jan 2024 sample (~50 MB)
+make spark-image                           # Spark + Delta + Kafka jars
+make up                                    # Kafka x3, Schema Registry, MinIO, Postgres, Kafka UI
+make topics                                # create the topics
+make monitoring-up                         # Prometheus, Grafana, API
+make streaming-up                          # Bronze, Silver, Gold jobs
+make produce SPEED=0 LIMIT=100000          # SPEED=1 is real time, 0 is as fast as possible
 ```
 
 | Service | URL |
 |---|---|
-| Grafana (admin / `GRAFANA_ADMIN_PASSWORD`) | http://localhost:3000 |
-| Prometheus (targets, alerts) | http://localhost:9090 |
-| API + OpenAPI | http://localhost:8000/docs |
-| Kafka UI (stopped while streaming; `docker compose ... start kafka-ui`) | http://localhost:8080 |
-| Postgres (host port) | `localhost:5433` — `make psql` |
+| Grafana (admin / `admin`) | http://localhost:3000 |
+| Prometheus | http://localhost:9090 |
+| API docs | http://localhost:8000/docs |
+| Kafka UI (stopped while Spark jobs run, to save memory) | http://localhost:8080 |
 
-```bash
-curl -s "localhost:8000/v1/zones/top?limit=3"
-curl -s "localhost:8000/v1/pipeline/status"
-```
+Tests: `make test`, `make test-api`, `make test-spark`, `make e2e-silver`. Reliability drills: `make drill-broker`, `make drill-sigkill` and others. Drills reset the data, so use them locally only.
 
-### Tests
+## 5. What was verified
 
-```bash
-make test            # 9 unit tests (host)
-make test-api        # 29 API integration tests (real Postgres, real DDL, read-only role)
-make test-spark      # Spark tests inside the image: DQ rules, Silver batch, Gold windows + late data, metrics, cold start
-make e2e-silver      # 300k events with injected faults vs an independent plain-Python oracle
-bash infrastructure/scripts/e2e_gold.sh   # Delta == Postgres == batch recompute == oracle
-make obs-demo        # 65 live checks incl. every Grafana panel query
-```
-
-CI (`.github/workflows/ci.yml`) runs the unit, API-integration and Spark tests, validates the compose file and alert rules, and checks that the dashboards match their generator. The Docker drills need the full stack and are local-only.
-
-## What was verified
-
-Each phase was run end to end before the next began. Details and the bugs found along the way are in [DEVELOPMENT.md](DEVELOPMENT.md).
-
-| Claim | Evidence |
+| Check | Result |
 |---|---|
-| Nothing lost between Kafka and Bronze | Bronze rows == Kafka rows == distinct offsets == distinct event_ids (200,000) |
-| DQ rules and dedup are correct | 300k events with injected duplicates (1 in 50), poison bytes (1 in 997), null pickups (1 in 1009): Silver rows, per-rule quarantine counts and dedup counts match a **plain-Python oracle that shares no code with Spark** |
-| Gold is correct | Delta == Postgres == batch recompute from Silver for all 5 tables, and an oracle computed from the raw parquet agrees on 10 measures |
-| Late data behaves as designed | Test on real job code and real Delta tables: within-watermark updates a window; beyond-watermark is dropped and visible in metrics |
-| API is safe and correct | 29 integration tests (including SQL-injection attempts and DB-down behaviour) and an oracle comparison of every endpoint |
-| Dashboards show real data | All 47 panel queries return data through Grafana's own query API; an alert was fired and cleared on purpose |
+| Nothing lost from Kafka to Bronze | Bronze rows equal Kafka rows (200,000) |
+| Data-quality rules and dedup | 300k events with injected duplicates, garbage bytes and null timestamps match the oracle exactly |
+| Gold aggregates | Delta equals Postgres equals a batch recompute, and an oracle built from the raw parquet agrees |
+| Failure handling | Six drills, all passed, listed below |
+| Tests | 9 unit, 29 API, 46 Spark, all green in GitHub Actions |
 
-Data-quality output for the sample: [docs/dq_report.md](docs/dq_report.md).
-
-## Reliability drills
-
-Run with `make drill-<name>` (they reset the lake, so local data only). Every drill ends by checking Silver and Gold against the independent oracles. Full evidence and the bugs these drills found: **[docs/reliability.md](docs/reliability.md)**.
-
-| Drill | Fault | Result |
+| Failure drill | What happens | Result |
 |---|---|---|
-| `drill-producer` | Broker backpressure; SIGTERM mid-run | Passed: 60k sent = acked, 276 backpressure events, 0 failed; SIGTERM flushes and exits 0 |
-| `drill-graceful` | `docker stop` of Silver mid-batch | Passed (9/9): exit code 0 (was 143), in-flight batch finished first |
-| `drill-crash` | Process dies **after** the Delta write, **before** the offset commit | Passed (6/6): 100,000 rows, no duplicates. **Control with idempotence off:** 19,997 duplicate rows (one replayed batch), so the test can detect the failure it guards against |
-| `drill-coldstart` | Silver/Gold started before upstream table exists | Passed; found and fixed a real cross-process bug |
-| `drill-broker` | Stop `kafka-2` for ~45 s under a 100k-event replay | Passed (10/10): no message lost, ISR recovered in 28 s, Silver and Gold exact, Spark jobs unaffected |
-| `drill-sigkill` | Kill the JVM of Bronze (t+20 s), Silver (t+70 s) and Gold (t+120 s) under load | Passed (7/7): compose restarted each driver itself (12–17 s to serve metrics); Silver and Gold exact against the oracles |
+| Broker down | `kafka-2` stopped for about 45 s under load | No data lost, cluster back in sync after 28.5 s, Silver and Gold exact |
+| Spark jobs killed | Each job's JVM killed in turn under load | Compose restarted all three on its own in 12-17 s, results exact |
+| Crash after write | Process dies after the Delta write, before the offset commit | No duplicates. A control run with the protection off created 19,997 duplicates, so the test can catch the failure |
+| Graceful shutdown | `docker stop` during a batch | Exit code 0 (it was 143), in-flight batch finishes |
+| Cold start | Downstream job starts before its table exists | Waits and recovers (a real bug, now fixed) |
+| Producer | Overload and SIGTERM | 60k sent and acked, 0 lost, SIGTERM flushes cleanly |
 
-## Measured performance
+Measured on one laptop (single run each): the producer reaches about 31,000 events/s, and Silver processes about 1,000 events/s, which makes it the bottleneck under a fast replay.
 
-One machine (M1 Pro, Docker VM 8 GB / 5 CPUs), one run each, no variance estimate.
+Full results, the 8 bugs these drills exposed, and scaling notes: [docs/reliability.md](docs/reliability.md). Dashboards and alerts: [docs/observability.md](docs/observability.md). Data quality report: [docs/dq_report.md](docs/dq_report.md). Common problems: [docs/troubleshooting.md](docs/troubleshooting.md). Build log: [DEVELOPMENT.md](DEVELOPMENT.md).
 
-| Measure | Value |
+## Screenshots
+
+| | |
 |---|---|
-| Producer, unthrottled (idempotent, acks=all, lz4) | ~31,000 events/s |
-| Bronze → Silver → Gold, three drivers, 1000x replay | ~815 events/s offered; Silver ~1,000 events/s processed at peak |
-| Worst end-to-end latency (producer → Silver) | 82–111 s at the burst peak |
-| Peak true Kafka lag | 26,871 records (broker outage), 68,497 (three Spark crashes), draining to 0 |
+| ![Demand dashboard](docs/screenshots/grafana-mobility-demand.png) **Demand dashboard (Gold data)** | ![API docs](docs/screenshots/api-swagger-docs.png) **API (OpenAPI docs)** |
+| ![Kafka topics](docs/screenshots/kafka-ui-topics.png) **Kafka topics (Kafka UI)** | ![Alert firing](docs/screenshots/prometheus-alert-firing.png) **A real alert firing (Prometheus)** |
 
-The latency and lag numbers show that a single `local[2]` Silver driver is the bottleneck, not Kafka. Scaling options are in [docs/reliability.md](docs/reliability.md#scaling-considerations).
+More images and what each panel shows: [docs/observability.md](docs/observability.md).
 
-## Repository layout
+## 6. Limitations
+
+- **Not built:** Airflow, dbt, Superset, a live data producer, table compaction, and the batch job that repairs late data.
+- **Throughput:** one small Spark driver per layer (about 1,000 events/s). Scaling out is described in the docs but not demonstrated.
+- **Not tested:** losing two brokers, MinIO or Postgres failure, and deleting a checkpoint while keeping the table.
+- **Alerting:** alerts show in Prometheus and Grafana only, with no Alertmanager.
+- **Local-dev security:** default passwords, and no authentication or TLS on the API.
+
+## 7. Repository layout
 
 ```
-producers/        replay producer (TLC -> Avro -> Kafka), fault injectors, DLQ
-schemas/          Avro schema (trip_event_v1.avsc)
-spark_jobs/       bronze_stream, silver_stream, gold_stream, dq_rules, gold_aggregates, gold_sinks, metrics, verifiers
-api/              FastAPI service (routers, db pool, schemas, metrics)
-infrastructure/   docker-compose.yml, Spark image, Postgres DDL, topic + demo scripts
+producers/        replay producer, fault injectors, dead-letter queue
+schemas/          Avro schema
+spark_jobs/       Bronze, Silver and Gold jobs, data-quality rules, aggregates, sinks, verifiers
+api/              FastAPI service
+infrastructure/   docker-compose, Spark image, Postgres schema, helper scripts
 monitoring/       Prometheus config and alert rules, Grafana provisioning
-dashboards/       dashboard generator (JSON is generated, not hand-edited)
-tests/            unit, spark, integration, e2e (oracles), recovery (drills)
-docs/             observability, DQ report, reliability, screenshots
+dashboards/       dashboard generator
+tests/            unit, spark, integration, e2e oracles, recovery drills
+docs/             reliability, observability, data quality, screenshots
 ```
 
-## Limitations
-
-Stated plainly, because they matter more than the features:
-
-- **Not built:** Airflow, dbt, Superset, a live (Wikimedia) producer, compaction (`OPTIMIZE`/`VACUUM`), and the batch repair job for late data. Delta tables are small-file heavy.
-- **Throughput:** one `local[2]` driver per layer, ~1k events/s. Horizontal scaling (Spark cluster, more partitions) is described in the docs, **not demonstrated**.
-- **Delivery guarantee:** effectively-once *per sink*. There is no cross-system transaction.
-- **Late data** beyond the 10 min watermark is dropped from streaming Gold. Spark's drop counter counts groups, not events (a lower bound).
-- **Not tested:** loss of two brokers (KRaft quorum), MinIO or Postgres failure, deleting a checkpoint while keeping the table.
-- **Alerting:** no Alertmanager. Alerts are visible in Prometheus and Grafana only.
-- **Local-dev security:** default passwords, no TLS or auth on the API, `bitnamilegacy/minio` (a frozen image: upstream images can no longer be pulled).
-- **Data:** TLC timestamps are NYC local time stored as-is and read as UTC. TLC license text was not located; attribution only (data from the NYC Taxi & Limousine Commission).
-
-## Troubleshooting
-
-| Symptom | Cause / fix |
-|---|---|
-| Containers exit with code 137 or Spark jobs hang | Docker VM is out of memory. Use an 8 GB VM, keep Kafka UI stopped while the three drivers run |
-| `make verify-*` or a drill times out | Do not run a fourth Spark JVM next to three live drivers; stop the streaming services first (the drills do this) |
-| `docker kill` does not restart a Spark service | Docker never applies restart policies to a manual kill. A crash does restart it (`restart: on-failure`) |
-| Silver/Gold wait forever at start | They wait for the upstream Delta table (`WAITING_FOR_UPSTREAM` in the log). Start Bronze and produce data |
-| API returns 503 | Postgres unreachable or connection pool timeout. `/health/live` stays 200, `/health/ready` is 503 |
-| `Postgres not reachable on localhost:5433` in tests | Start the stack (`make up`) or let CI's service container provide it |
-| Docker build cannot reach PyPI | The API image uses vendored dependencies: run `make api-vendor` first |
-| Reset everything | `bash infrastructure/scripts/reset_data.sh` (**deletes** topics, lakehouse, checkpoints and gold tables) |
-
-## Data and license
-
-NYC TLC Trip Record Data, from the NYC Taxi & Limousine Commission. TLC does not guarantee accuracy. Re-check TLC's terms before redistributing any data. This repository does not include the data files.
+Data: NYC Taxi & Limousine Commission trip records. TLC does not guarantee accuracy, and this repository does not include the data files.
