@@ -66,15 +66,15 @@ sequenceDiagram
   P->>K: Avro event (key=event_id), acks=all, idempotent
   Note over P,K: row that cannot be serialised goes to trips.dlq.v1
   K->>B: micro-batch (maxOffsetsPerTrigger caps batch size)
-  B->>B: append raw bytes + (topic,partition,offset); txnAppId/txnVersion=batchId, so a replayed batch is skipped
+  B->>B: append raw bytes and Kafka coordinates. txnAppId and txnVersion=batchId make a replayed batch a no-op
   B->>S: stream the Delta table
   S->>S: decode Avro, apply rule catalog
-  S->>S: ERROR rule -> Quarantine (raw bytes kept); WARN -> DQ score -0.1
+  S->>S: ERROR rule sends the row to Quarantine with raw bytes kept. WARN rule lowers the DQ score by 0.1
   S->>S: insert-only MERGE on event_id (drops in-batch and cross-batch duplicates)
   S->>G: stream the Silver table
-  G->>G: windows on event time + watermark (10 min); late-beyond-watermark is dropped and counted
+  G->>G: event-time windows with a 10 min watermark. Events later than that are dropped and counted
   G->>G: MERGE into Delta Gold (5 tables)
-  G->>PG: INSERT ... ON CONFLICT DO UPDATE on the window key
+  G->>PG: upsert on the window key (INSERT ON CONFLICT DO UPDATE)
 ```
 
 | Layer | Content | Why it exists |
