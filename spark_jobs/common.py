@@ -9,6 +9,10 @@ BRONZE_PATH = os.getenv("BRONZE_PATH", "s3a://lakehouse/bronze/trips_raw")
 CHECKPOINT_ROOT = os.getenv("CHECKPOINT_ROOT", "s3a://checkpoints")
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka-1:9092,kafka-2:9092,kafka-3:9092")
 RAW_TOPIC = os.getenv("RAW_TOPIC", "trips.raw.v1")
+SILVER_PATH = os.getenv("SILVER_PATH", "s3a://lakehouse/silver/trips")
+QUARANTINE_PATH = os.getenv("QUARANTINE_PATH", "s3a://lakehouse/silver/trips_quarantine")
+DQ_METRICS_PATH = os.getenv("DQ_METRICS_PATH", "s3a://lakehouse/silver/dq_metrics")
+TRIP_SCHEMA_PATH = os.getenv("TRIP_SCHEMA_PATH", "/opt/app/schemas/trip_event_v1.avsc")
 
 
 def build_spark(app_name: str) -> SparkSession:

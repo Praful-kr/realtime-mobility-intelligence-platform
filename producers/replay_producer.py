@@ -63,6 +63,7 @@ class ReplayProducer:
         self.args = args
         self.stop = False
         self.sent = self.acked = self.failed = self.dlq = self.backpressure_events = 0
+        self.injected_dups = self.injected_poison = self.injected_null_pickup = 0
         sr = SchemaRegistryClient({"url": self.s.schema_registry_url})
         self.serializer = AvroSerializer(sr, SCHEMA_PATH.read_text(), conf={"auto.register.schemas": True})
         self.producer = Producer({
@@ -118,13 +119,13 @@ class ReplayProducer:
             if self.stop:
                 break
             chunk = table.slice(offset, min(20000, total - offset)).to_pylist()
-            for row in chunk:
+            for pos, row in enumerate(chunk, start=offset):
                 if self.stop:
                     break
                 delay = clock.delay_for(row["pickup_ts"]) if row["pickup_ts"] else 0.0
                 if delay > 0:
                     time.sleep(delay)
-                self._emit(row)
+                self._emit(row, pos)
                 now = time.monotonic()
                 if now - last_report >= 5:
                     last_report = now
@@ -137,11 +138,21 @@ class ReplayProducer:
                                            "dlq": self.dlq, "unflushed": remaining, "seconds": round(elapsed, 2),
                                            "avg_rate_per_s": round(self.sent / elapsed) if elapsed else 0,
                                            "backpressure_events": self.backpressure_events,
+                                           "injected_dups": self.injected_dups,
+                                           "injected_poison": self.injected_poison,
+                                           "injected_null_pickup": self.injected_null_pickup,
                                            "interrupted": self.stop})
         return 0 if (remaining == 0 and self.failed == 0) else 1
 
-    def _emit(self, row: dict) -> None:
+    def _emit(self, row: dict, pos: int) -> None:
+        """`pos` = 0-based position in the replay. Fault injection is position-based (never random)
+        so tests can predict exactly which events are affected: every Nth event (1-based)."""
+        a = self.args
+        hit = lambda every: bool(every) and (pos + 1) % every == 0  # noqa: E731
         taxi_type, src_file, src_row = row.pop("taxi_type"), row.pop("source_file"), row.pop("source_row")
+        if hit(a.inject_null_pickup_every):
+            row["pickup_ts"] = None  # no event time -> must be diverted to the DLQ, not Kafka raw topic
+            self.injected_null_pickup += 1
         try:
             event = row_to_event(row, taxi_type, src_file, src_row, datetime.now(timezone.utc))
             value = self.serializer(event, SerializationContext(self.s.raw_topic, MessageField.VALUE))
@@ -151,8 +162,18 @@ class ReplayProducer:
                          {"taxi_type": taxi_type, "source_file": src_file, "source_row": src_row})
             self.producer.poll(0)
             return
-        self._produce_blocking(self.s.raw_topic, event["event_id"].encode(), value, self._on_delivery)
+        key = event["event_id"].encode()
+        self._produce_blocking(self.s.raw_topic, key, value, self._on_delivery)
         self.sent += 1
+        if hit(a.inject_dup_every):  # at-least-once redelivery: identical bytes, same key
+            self._produce_blocking(self.s.raw_topic, key, value, self._on_delivery)
+            self.sent += 1
+            self.injected_dups += 1
+        if hit(a.inject_poison_every):  # undecodable bytes (valid-looking magic byte, garbage body)
+            self._produce_blocking(self.s.raw_topic, f"poison-{pos}".encode(),
+                                   b"\x00\x00\x00\x00\x01\xff\xfegarbage", self._on_delivery)
+            self.sent += 1
+            self.injected_poison += 1
         if self.sent % 1000 == 0:
             self.producer.poll(0)
 
@@ -167,6 +188,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--window-start", type=datetime.fromisoformat, default=datetime(2024, 1, 1))
     p.add_argument("--window-end", type=datetime.fromisoformat, default=datetime(2024, 2, 1))
     p.add_argument("--max-queue", type=int, default=100000)
+    p.add_argument("--inject-dup-every", type=int, default=0, help="re-send every Nth event (duplicate)")
+    p.add_argument("--inject-poison-every", type=int, default=0, help="after every Nth event send garbage bytes")
+    p.add_argument("--inject-null-pickup-every", type=int, default=0,
+                   help="blank pickup time on every Nth event (-> DLQ)")
     return p.parse_args(argv)
 
 

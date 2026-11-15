@@ -40,3 +40,23 @@ verify-bronze:
 
 test:
 	$(PY) -m pytest tests/unit -q
+
+# ---- Phase 3 Silver ----
+.PHONY: silver verify-silver dq-report test-spark reset-data e2e-silver
+silver:
+	$(SPARK_JOB) silver_stream --trigger $(or $(TRIGGER),availableNow)
+
+verify-silver:
+	$(SPARK_JOB) verify_silver 2>&1 | grep -E "SILVER_REPORT"
+
+dq-report:
+	@$(SPARK_JOB) dq_report 2>/dev/null | sed -n '/^# /,$$p'
+
+test-spark:   ## Spark tests run inside the Spark image (no JVM on the host)
+	$(COMPOSE) --profile jobs run --rm --entrypoint bash spark-job /opt/app/infrastructure/spark/run_pytest.sh tests/spark 2>&1 | tail -40
+
+reset-data:   ## DESTRUCTIVE: deletes Kafka topics, lakehouse and checkpoints (local dev data only)
+	bash infrastructure/scripts/reset_data.sh
+
+e2e-silver:
+	bash infrastructure/scripts/e2e_silver.sh

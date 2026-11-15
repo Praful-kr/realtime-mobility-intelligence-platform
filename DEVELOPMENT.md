@@ -92,7 +92,8 @@ flowchart LR
 - [x] Architecture + plan
 - [x] Phase 1: scaffold + core stack (verified 2026-11-15, see section 5)
 - [x] Phase 2: vertical slice producer -> Kafka -> Bronze Delta on MinIO (verified, section 5)
-- [ ] Phase 3: Silver (validation, quarantine, dedup, DQ score)
+- [x] Phase 3: Silver: validation, quarantine, dedup, DQ score/report (verified against independent oracle, section 5)
+- [ ] Phase 4: Gold windows + Postgres serving sink
 
 ## 5. Test results
 
@@ -110,7 +111,14 @@ flowchart LR
 - `make bronze` (availableNow) then `make verify-bronze`: **PASS** — Bronze rows 200000 == Kafka rows 200000 == distinct (topic,partition,offset) 200000 == distinct decoded event_id 200000 (yellow 196229, green 3771). 26 MiB in MinIO.
 - Re-running `make bronze` against the same checkpoint added no rows (still PASS).
 
-**Not yet demonstrated (do not read as claimed):** DLQ path on real data (the 200k slice are the earliest-sorted rows, none have null pickup; only unit-tested), mid-batch crash recovery, continuous (non-availableNow) trigger, replay at 1x/10x/100x wall-clock (only the clock math is unit-tested), duplicate re-ingestion.
+**Phase 2 gaps closed in Phase 3:** DLQ path and duplicate re-ingestion are now exercised on real data (below).
+
+**Phase 3 (executed, passing):**
+- `make test` 9 unit tests + `make test-spark` **28 tests** in the Spark image: every ERROR/WARN rule has a parametrized test (a meta-test fails if a rule lacks one), garbage/wrong-magic/null/truncated/empty payloads, in-batch and cross-batch dedup, retry of the same batch id is idempotent (silver, quarantine, metrics unchanged), all-invalid batch.
+- **Bug found by those tests:** `from_avro(..., PERMISSIVE)` returns a struct of all-NULL fields for garbage, not a NULL struct, so my first undecodable check never fired (garbage was only quarantined by accident as `null_fare`). Fixed: a NULL required field (`event_id`/`pickup_ts`) means decode failure.
+- **E2E vs independent oracle** (`make e2e-silver`; oracle in `tests/e2e/silver_oracle.py` re-implements the rules in plain Python, shares no code with Spark): 300k replayed rows with injected faults (dup every 50th, poison bytes every 997th, null pickup every 1009th). **ORACLE_RESULT PASS, exact match** on: Bronze rows 305,998; Silver 295,419 (= distinct event_ids); quarantine 4,660 with per-rule counts (negative_fare 4,317, negative_total 4,200, undecodable 300, dropoff_before_pickup 10, implausible_distance 10, pickup_out_of_range 5, trip_too_long 2, implausible_fare 1); warning counts on Silver; duplicates dropped 5,919; DLQ topic offsets 297 = injected null-pickup events. Producer: sent=acked=305,998, failed 0, ~32.8k events/s.
+- DQ report generated from the tables: `docs/dq_report.md` (received = quarantined + dup-dropped + inserted reconciles; mean Silver DQ score 0.9906; 92.05% of Silver rows have zero warnings).
+- Cross-batch dedup on the live pipeline: replayed the first 5,000 events (same ids) as batch 1 -> 4,922 dropped vs Silver, 4 inserted. The 4 are exactly the events the injector had diverted to the DLQ in the first run (positions 1008/2017/3026/4035), i.e. explained, not noise. Re-running Silver on the drained checkpoint processed 0 batches.
 
 ## 6. Known limitations (so far)
 
@@ -124,3 +132,9 @@ flowchart LR
 - TLC timestamps are NYC local wall-clock; stored as-is and interpreted as UTC (no DST conversion). Hour-of-day demand therefore equals NYC local hour.
 - Partition key = event_id (uniform spread, no per-zone ordering). Keying by PULocationID would give locality but hot partitions (JFK/LGA).
 - Bronze `txnVersion = batchId` idempotence holds only while the checkpoint exists; deleting a checkpoint without clearing the table would re-append.
+- Quarantine is not deduplicated by design (every rejected delivery kept): replaying data re-quarantines its invalid rows (+74 in the replay above).
+- DLQ verified by message **count** only; DLQ payload contents are covered by unit tests of the build path, no DLQ consumer/reprocessor exists yet.
+- Avro decoding cannot detect *trailing* garbage after a valid record (decoder stops at record end); only structural failure is caught.
+- Silver MERGE creates small files per batch/partition; compaction (`OPTIMIZE`) is planned for the Airflow phase and not yet implemented.
+- The E2E run processed the 306k events as ONE micro-batch (`availableNow`); multi-batch behaviour was shown by the replay run and the unit tests, but the continuous trigger and mid-batch crash recovery are still undemonstrated (Phase 7).
+- `reset-data` is destructive (topics, lakehouse, checkpoints); local dev only.
