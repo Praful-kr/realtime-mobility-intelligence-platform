@@ -11,6 +11,11 @@ PROM = {"type": "prometheus", "uid": "prometheus"}
 PG = {"type": "grafana-postgresql-datasource", "uid": "postgres"}
 OUT = Path(__file__).parent / "grafana"
 R = "$__rate_interval"
+# Headline rate/lag stats show the PEAK over the selected range: the "last value" of a finished run is just 0.
+STAT_MAX = {"options": {"reduceOptions": {"calcs": ["max"], "fields": "", "values": False},
+                        "colorMode": "value", "graphMode": "area"},
+            "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "blue"}}, "overrides": []}}
+STAT_BLUE = {"fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "blue"}}, "overrides": []}}
 
 
 def prom(expr, legend="", ref="A"):
@@ -53,6 +58,10 @@ class Board:
             p["options"] = {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": False},
                             "colorMode": "value", "graphMode": "area"}
         if extra:
+            extra = dict(extra)
+            fc = extra.pop("fieldConfig", None)
+            if fc:   # merge, do not replace: keeps the unit set above
+                p["fieldConfig"]["defaults"].update(fc.get("defaults", {}))
             p.update(extra)
         self.d["panels"].append(p)
         self._x += w
@@ -67,12 +76,12 @@ class Board:
 def pipeline():
     b = Board("mobility-pipeline", "Pipeline Overview")
     b.row("Headline")
-    b.panel("Events produced / s", "stat", [prom(f"sum(rate(producer_events_sent_total[{R}]))")], w=4, h=4,
-            unit="ops", desc="Replay producer send rate (host process, only while a replay runs).")
-    b.panel("Events processed / s (Silver)", "stat",
-            [prom(f'sum(rate(spark_input_rows_total{{query="silver-trips"}}[{R}]))')], w=4, h=4, unit="ops")
-    b.panel("Kafka consumer lag", "stat", [prom('sum(kafka_topic_partition_current_offset{topic="trips.raw.v1"}) - sum(spark_kafka_processed_offset_sum{topic="trips.raw.v1"})')], w=4, h=4, unit="short",
-            desc="Records in the raw topic (broker log-end offset) minus the offset Bronze has processed.")
+    b.panel("Events produced / s (peak)", "stat", [prom(f"sum(rate(producer_events_sent_total[{R}]))")], w=4, h=4,
+            unit="ops", extra=STAT_MAX, desc="Peak replay-producer send rate in the range (host process, only while a replay runs).")
+    b.panel("Silver events / s (peak)", "stat",
+            [prom(f'sum(rate(spark_input_rows_total{{query="silver-trips"}}[{R}]))')], w=4, h=4, unit="ops", extra=STAT_MAX)
+    b.panel("Kafka consumer lag (peak)", "stat", [prom('sum(kafka_topic_partition_current_offset{topic="trips.raw.v1"}) - sum(spark_kafka_processed_offset_sum{topic="trips.raw.v1"})')], w=4, h=4, unit="short", extra=STAT_MAX,
+            desc="Peak of: records in the raw topic (broker log-end offset) minus the offset Bronze has processed.")
     b.panel("DLQ events (total)", "stat",
             [prom('sum(kafka_topic_partition_current_offset{topic="trips.dlq.v1"})')], w=4, h=4)
     b.panel("Kafka brokers", "stat", [prom("kafka_brokers")], w=4, h=4)
@@ -138,14 +147,14 @@ def api():
         prom(f'sum(rate(api_http_requests_total{{status=~"4.."}}[{R}])) or vector(0)', "4xx", "B")], w=8, unit="reqps")
     b.panel("In-flight requests", "timeseries", [prom("api_http_requests_in_flight", "in flight")], w=8)
     b.panel("Database-unavailable responses", "timeseries",
-            [prom(f"increase(api_db_errors_total[{R}]) or vector(0)", "db errors")], w=8)
+            [prom(f"sum(increase(api_db_errors_total[{R}])) or vector(0)", "db errors")], w=8)
     b.panel("API up", "stat", [prom('up{job="api"}')], w=6, h=4)
     b.save("api.json")
 
 
 def business():
     b = Board("mobility-business", "Mobility Demand (Gold)", time_from="2024-01-01T00:00:00.000Z",
-              time_to="2024-01-05T00:00:00.000Z", refresh="")
+              time_to="2024-01-04T16:30:00.000Z", refresh="")
     tf = "$__timeFilter(window_start)"
     b.row("Demand and revenue")
     b.panel("Trips per minute", "timeseries",
@@ -180,7 +189,7 @@ def business():
                  f"FROM gold.v_demand_anomalies WHERE {tf} ORDER BY abs(z_score) DESC LIMIT 10", "table")], w=12)
     b.panel("Total trips / revenue in range", "stat",
             [sql(f"SELECT SUM(trips) AS trips FROM gold.hourly_demand WHERE {tf}", "table", "A"),
-             sql(f"SELECT SUM(revenue) AS revenue FROM gold.hourly_demand WHERE {tf}", "table", "B")], w=12, h=4)
+             sql(f"SELECT SUM(revenue) AS revenue FROM gold.hourly_demand WHERE {tf}", "table", "B")], w=12, h=4, extra=STAT_BLUE)
     b.save("business.json")
 
 

@@ -29,8 +29,8 @@
   {
    "id": 2,
    "type": "stat",
-   "title": "Events produced / s",
-   "description": "Replay producer send rate (host process, only while a replay runs).",
+   "title": "Events produced / s (peak)",
+   "description": "Peak replay-producer send rate in the range (host process, only while a replay runs).",
    "targets": [
     {
      "refId": "A",
@@ -56,14 +56,18 @@
    },
    "fieldConfig": {
     "defaults": {
-     "unit": "ops"
+     "unit": "ops",
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "blue"
+     }
     },
     "overrides": []
    },
    "options": {
     "reduceOptions": {
      "calcs": [
-      "lastNotNull"
+      "max"
      ],
      "fields": "",
      "values": false
@@ -75,7 +79,7 @@
   {
    "id": 3,
    "type": "stat",
-   "title": "Events processed / s (Silver)",
+   "title": "Silver events / s (peak)",
    "description": "",
    "targets": [
     {
@@ -102,14 +106,18 @@
    },
    "fieldConfig": {
     "defaults": {
-     "unit": "ops"
+     "unit": "ops",
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "blue"
+     }
     },
     "overrides": []
    },
    "options": {
     "reduceOptions": {
      "calcs": [
-      "lastNotNull"
+      "max"
      ],
      "fields": "",
      "values": false
@@ -121,8 +129,8 @@
   {
    "id": 4,
    "type": "stat",
-   "title": "Kafka consumer lag",
-   "description": "Records in the raw topic (broker log-end offset) minus the offset Bronze has processed.",
+   "title": "Kafka consumer lag (peak)",
+   "description": "Peak of: records in the raw topic (broker log-end offset) minus the offset Bronze has processed.",
    "targets": [
     {
      "refId": "A",
@@ -148,14 +156,18 @@
    },
    "fieldConfig": {
     "defaults": {
-     "unit": "short"
+     "unit": "short",
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "blue"
+     }
     },
     "overrides": []
    },
    "options": {
     "reduceOptions": {
      "calcs": [
-      "lastNotNull"
+      "max"
      ],
      "fields": "",
      "values": false

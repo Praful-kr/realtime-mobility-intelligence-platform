@@ -11,7 +11,7 @@
  "refresh": "",
  "time": {
   "from": "2024-01-01T00:00:00.000Z",
-  "to": "2024-01-05T00:00:00.000Z"
+  "to": "2024-01-04T16:30:00.000Z"
  },
  "panels": [
   {
@@ -490,7 +490,12 @@
     "y": 33
    },
    "fieldConfig": {
-    "defaults": {},
+    "defaults": {
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "blue"
+     }
+    },
     "overrides": []
    },
    "options": {

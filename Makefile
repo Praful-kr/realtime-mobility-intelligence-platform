@@ -110,3 +110,8 @@ obs-check:
 
 obs-demo:
 	bash infrastructure/scripts/observability_demo.sh
+
+# ---- Screenshots for the README (needs the stack up; uses the locally installed Google Chrome) ----
+.PHONY: screenshots
+screenshots:   ## see docs/observability.md "Screenshots" for the live-state steps that make them look healthy
+	cd tools/screenshots && npm install --no-audit --no-fund --silent && node capture.mjs

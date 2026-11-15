@@ -160,6 +160,8 @@ flowchart LR
 3. Producer metrics vanish from instant queries once the short-lived host process exits (staleness); final counters are read with `max_over_time`.
 4. My first alert test looped on "any firing alert" (an unrelated real alert was already firing) and proved only `pending`; redone against `TargetDown` specifically.
 
+**Screenshots (executed, visually checked):** 10 PNGs in `docs/screenshots/` captured from the live stack by `tools/screenshots/capture.mjs` (Playwright + local Chrome). Each was opened and inspected; the first pass was NOT good enough and was redone: pipeline stats read 0 (last value of a finished run -> now peak, blue), a false "anomaly" at the partial last minute of the sample (range now ends 16:30), Prometheus pages showed 4 targets DOWN / `TargetDown` firing because I had stopped the jobs (recaptured with everything running, plus a deliberate real firing alert), cropped/dead-space heights, a duplicated legend entry, a cluttered Swagger schemas list. A zsh word-splitting slip (`C="docker compose ..."; $C up`) silently did nothing while I thought the jobs were starting; caught because the targets stayed down.
+
 ## 6. Known limitations (so far)
 
 - 8 GB Docker VM: Airflow and Superset run under separate profiles, not alongside the full streaming stack.
@@ -193,5 +195,5 @@ flowchart LR
 - Observability: no Alertmanager (alerts are visible in Prometheus/Grafana only); Grafana admin password is `admin` by default; no Postgres/MinIO/node exporters or container (cAdvisor) metrics; dashboards' Kafka panels cover topics matching `trips\..*` only.
 - Memory: the 3 streaming drivers + monitoring + core stack run inside the 8 GB Docker VM only with Kafka UI stopped (`make streaming-up` does that); Gold peaked at 1.79 of its 2 GiB limit in one run, an OOM kill is possible on larger data.
 - Latency/throughput numbers above come from one machine and one run each; no variance estimate.
-- No screenshots were captured (no image renderer / browser driven); instructions are in `docs/observability.md`.
+- Screenshots exist (`docs/screenshots/`, 10 images, `tools/screenshots/capture.mjs`); the pipeline dashboard image is a past-run window, the Prometheus images were taken with a replay + streaming jobs running.
 - Producer metrics only exist while a replay runs; the producer is not containerised.

@@ -63,6 +63,50 @@ Producer: `producer_events_{sent,acked,failed}_total`, `producer_dlq_events_tota
 
 ## Screenshots
 
-Not captured: Grafana's image renderer plugin is not installed and I did not drive a browser. Open
-http://localhost:3000 after `make obs-demo`'s services are up (or `make streaming-up` + `make produce`), pick
-*Pipeline Overview*, set the time range to "Last 30 minutes".
+All captured from the running stack by `tools/screenshots/capture.mjs` (Playwright driving the locally installed
+Google Chrome; no browser download). They are real renders of the live system, not mock-ups.
+
+### Pipeline Overview (Grafana)
+Window = a live run of 102,000 events replayed at 1000x with injected late, duplicate, garbage and null-pickup events.
+Headline stats show the **peak** over the range. Note the true-lag spike (~34k records) draining to 0, the DLQ at 99,
+Silver batches falling behind the 5 s trigger, and the producer/spark targets appearing and disappearing in "Scrape targets".
+
+![Pipeline Overview](screenshots/grafana-pipeline-overview.png)
+
+### Mobility Demand (Grafana, from Postgres Gold)
+300k replayed trips (Jan 1-4, 2024). Daily demand cycle, JFK as the top pickup zone, the New-Year-midnight demand anomaly
+(z = 40.3) at the top of the anomaly table. The range ends at 16:30 on Jan 4 to exclude the partial last minute where the
+sample was cut off (otherwise it shows up as a false "anomaly").
+
+![Mobility Demand](screenshots/grafana-mobility-demand.png)
+
+### API dashboard (Grafana)
+Two bursts of the 400-request / 20-thread load smoke: request rate per route, p50/p95/p99, in-flight peak ~20.
+
+![API dashboard](screenshots/grafana-api.png)
+
+### Prometheus: all 7 targets up, alerts, and one firing
+![Targets](screenshots/prometheus-targets.png)
+![Alerts, all inactive](screenshots/prometheus-alerts.png)
+`TargetDown` really firing: the API container was stopped, the alert fired after 33 s, and it cleared after restart.
+![TargetDown firing](screenshots/prometheus-alert-firing.png)
+
+### Kafka (Kafka UI) and the API
+Three brokers all in sync (60/60 partitions online, 0 under-replicated), `trips.raw.v1` with 305,998 messages at
+replication factor 3, the DLQ with 297, and the Avro schema registered with BACKWARD compatibility.
+
+![Kafka topics](screenshots/kafka-ui-topics.png)
+![Kafka brokers](screenshots/kafka-ui-brokers.png)
+![Schema registry](screenshots/kafka-ui-schema-registry.png)
+![API docs](screenshots/api-swagger-docs.png)
+
+### Re-taking them
+```bash
+make monitoring-up && make streaming-up          # streaming-up stops Kafka UI to save RAM; start it again later
+make produce SPEED=100 LIMIT=40000               # keeps the producer target up while you capture
+cd tools/screenshots && node capture.mjs         # or: --only grafana-api,prometheus-targets
+PIPELINE_WINDOW_JSON=window.json node capture.mjs --only grafana-pipeline-overview   # {"from_ms":..,"to_ms":..} of a past run
+```
+Gotchas learnt while doing this: capture Prometheus pages while everything is *running* (a stopped Spark job shows up as DOWN
+and `TargetDown` fires); stat panels show the last value by default, so a finished run reads 0 (hence the "peak" stats);
+crop heights in `capture.mjs` are tuned to the content, so re-check them if you add panels.
