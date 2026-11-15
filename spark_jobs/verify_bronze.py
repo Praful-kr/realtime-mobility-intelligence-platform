@@ -10,6 +10,7 @@ import json
 import sys
 from pathlib import Path
 
+from delta.tables import DeltaTable
 from pyspark.sql import functions as F
 from pyspark.sql.avro.functions import from_avro
 
@@ -35,7 +36,10 @@ def main() -> int:
     by_type = {r["taxi_type"]: r["n"] for r in decoded.groupBy("e.taxi_type").agg(F.count("*").alias("n")).collect()}
     schema_ids = [r[0] for r in bronze.select("schema_id").distinct().collect()]
 
-    report = {"bronze_rows": rows, "kafka_rows": kafka_rows, "distinct_offsets": distinct_coords,
+    hist = DeltaTable.forPath(spark, BRONZE_PATH).history().select("version", "operation", "operationMetrics").collect()
+    commit_rows = [int(r["operationMetrics"].get("numOutputRows", 0)) for r in sorted(hist, key=lambda r: r["version"])
+                   if r["operation"] == "WRITE" and r["operationMetrics"].get("numOutputRows")]
+    report = {"commit_rows": commit_rows, "bronze_rows": rows, "kafka_rows": kafka_rows, "distinct_offsets": distinct_coords,
               "distinct_event_ids": distinct_ids, "by_taxi_type": by_type, "schema_ids": schema_ids}
     print("VERIFY_REPORT " + json.dumps(report))
     ok = rows == kafka_rows == distinct_coords == distinct_ids

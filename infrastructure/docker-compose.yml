@@ -42,6 +42,7 @@ x-spark-stream: &spark-stream
   image: mobility-spark:3.5.3
   profiles: ["streaming"]
   restart: on-failure
+  stop_grace_period: 60s   # SIGTERM -> let the in-flight micro-batch finish (compose default is 10 s, then SIGKILL)
   depends_on:
     minio: {condition: service_healthy}
     kafka-1: {condition: service_healthy}

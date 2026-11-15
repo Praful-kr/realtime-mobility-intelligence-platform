@@ -38,19 +38,76 @@ def build_spark(app_name: str) -> SparkSession:
 def wait_for_delta_table(spark: SparkSession, path: str, poll_seconds: int = 5, timeout_seconds: int = 0) -> None:
     """Block until an upstream Delta table exists AND has a schema. Streaming-reading a table that its
     producer has not written yet fails with DELTA_SCHEMA_NOT_SET; on a cold start the layers come up in
-    any order, so each downstream job waits for its source (timeout 0 = wait forever)."""
+    any order, so each downstream job waits for its source (timeout 0 = wait forever).
+
+    Existence is checked against the OBJECT STORE (does _delta_log contain commits?), never via DeltaTable.isDeltaTable:
+    a waiter that polled before another process created the table kept a stale 'no such table' view and never saw the
+    table (reproduced across two containers, tests/recovery/repro_wait_s3a.py). Cached Delta logs and Spark file
+    indexes are dropped before the first real read.
+    """
     import time
 
-    from delta.tables import DeltaTable
-    waited = 0
+    jvm = spark._jvm
+    waited, last_err_log = 0, -60
     while True:
+        err = None
         try:
-            if DeltaTable.isDeltaTable(spark, path) and spark.read.format("delta").load(path).schema.fields:
-                return
-        except Exception:  # noqa: BLE001 - table mid-creation; retry
-            pass
+            log_dir = jvm.org.apache.hadoop.fs.Path(path.rstrip("/") + "/_delta_log")
+            fs = log_dir.getFileSystem(spark._jsc.hadoopConfiguration())
+            if fs.exists(log_dir) and len(fs.listStatus(log_dir)) > 0:
+                jvm.org.apache.spark.sql.delta.DeltaLog.clearCache()
+                spark.catalog.refreshByPath(path)
+                if spark.read.format("delta").load(path).schema.fields:
+                    return
+        except Exception as e:  # noqa: BLE001 - table mid-creation; retry, but never swallow silently
+            err = repr(e)[:300]
         if timeout_seconds and waited >= timeout_seconds:
             raise TimeoutError(f"upstream table not available: {path}")
         print(f"WAITING_FOR_UPSTREAM {path}", flush=True)
+        if err and waited - last_err_log >= 60:
+            print(f"WAITING_FOR_UPSTREAM_ERROR {err}", flush=True)
+            last_err_log = waited
         time.sleep(poll_seconds)
         waited += poll_seconds
+
+
+def run_until_stopped(queries, grace_seconds: int = 50) -> None:
+    """Block until the queries finish, one fails, or SIGTERM/SIGINT arrives.
+
+    Graceful stop = wait (up to grace_seconds) until no micro-batch is executing, THEN stop the queries, so a batch is not
+    interrupted half-way (StreamingQuery.stop() interrupts the running batch). Anything interrupted anyway is still safe:
+    sinks are idempotent and offsets are committed only after the sink write. Raises if any query failed so the process
+    exits non-zero and the orchestrator restarts it.
+    """
+    import signal
+    import threading
+    import time
+
+    stop = threading.Event()
+
+    def _signal(signum, _frame):
+        print(f"SHUTDOWN_REQUESTED signal={signum}", flush=True)
+        stop.set()
+
+    signal.signal(signal.SIGTERM, _signal)
+    signal.signal(signal.SIGINT, _signal)
+    while not stop.is_set() and any(q.isActive for q in queries):
+        if any(q.exception() is not None for q in queries):
+            break
+        stop.wait(1.0)
+    if stop.is_set():
+        deadline = time.time() + grace_seconds
+        while time.time() < deadline and any(q.status.get("isTriggerActive") for q in queries):
+            time.sleep(0.3)
+        print("SHUTDOWN_STOPPING_QUERIES (no batch in flight)" if time.time() < deadline
+              else "SHUTDOWN_GRACE_EXPIRED stopping mid-batch (safe: idempotent sinks)", flush=True)
+        for q in queries:
+            q.stop()
+        print("SHUTDOWN_COMPLETE", flush=True)
+        return
+    failed = [q for q in queries if q.exception() is not None]
+    for q in queries:
+        if q.isActive:
+            q.stop()
+    if failed:
+        raise RuntimeError(f"streaming query {failed[0].name} failed: {failed[0].exception()}")

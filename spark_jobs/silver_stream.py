@@ -16,7 +16,6 @@ Quarantine is *not* deduplicated: every rejected delivery is kept (audit trail +
 from __future__ import annotations
 
 import argparse
-import signal
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,7 +26,7 @@ from pyspark.sql.types import (LongType, MapType, StringType, StructField, Struc
                                DoubleType)
 
 from spark_jobs.common import (BRONZE_PATH, CHECKPOINT_ROOT, DQ_METRICS_PATH, QUARANTINE_PATH, SILVER_PATH,
-                               TRIP_SCHEMA_PATH, build_spark, wait_for_delta_table)
+                               TRIP_SCHEMA_PATH, build_spark, run_until_stopped, wait_for_delta_table)
 from spark_jobs.dq_rules import apply_rules, decode_bronze
 from spark_jobs.metrics import init_silver_series, record_silver_batch, start_metrics
 
@@ -154,10 +153,8 @@ def main() -> None:
     writer = (writer.trigger(availableNow=True) if args.trigger == "availableNow"
               else writer.trigger(processingTime=f"{int(args.trigger)} seconds"))
     query = writer.start()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_: query.stop())
     try:
-        query.awaitTermination()
+        run_until_stopped([query])
     finally:
         if listener is not None:
             spark.streams.removeListener(listener)

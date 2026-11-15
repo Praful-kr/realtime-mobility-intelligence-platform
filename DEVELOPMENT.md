@@ -96,7 +96,9 @@ flowchart LR
 - [x] Phase 4: Gold windows (tumbling+sliding, watermark) -> Delta MERGE + Postgres upsert; live concurrent run (section 5)
 - [x] Phase 5: FastAPI service over Gold (11 endpoints), health/readiness, JSON logs, Prometheus metrics (section 5)
 - [x] Phase 6: Prometheus + Grafana + kafka-exporter + app metrics, 3 provisioned dashboards, 8 alerts (section 5, docs/observability.md)
-- [ ] Phase 7: reliability drills (broker kill, Spark kill, checkpoint recovery, graceful shutdown)
+- [x] Phase 7: reliability drills (producer, graceful shutdown, crash-after-write with control, cold start, broker failure, Spark SIGKILL), section 5 and docs/reliability.md
+- [x] GitHub packaging: README (architecture + flow diagrams), docs/reliability.md, CI workflow, requirements.txt, `make data`, `make spark-image`
+- [ ] Not done by decision (scope cut for the GitHub release): Phase 8 (Airflow, dbt, Superset, compaction, late-data repair job), rebuild-from-Bronze drill, benchmark report, live Wikimedia producer, interview Q&A
 
 ## 5. Test results
 
@@ -162,6 +164,12 @@ flowchart LR
 
 **Screenshots (executed, visually checked):** 10 PNGs in `docs/screenshots/` captured from the live stack by `tools/screenshots/capture.mjs` (Playwright + local Chrome). Each was opened and inspected; the first pass was NOT good enough and was redone: pipeline stats read 0 (last value of a finished run -> now peak, blue), a false "anomaly" at the partial last minute of the sample (range now ends 16:30), Prometheus pages showed 4 targets DOWN / `TargetDown` firing because I had stopped the jobs (recaptured with everything running, plus a deliberate real firing alert), cropped/dead-space heights, a duplicated legend entry, a cluttered Swagger schemas list. A zsh word-splitting slip (`C="docker compose ..."; $C up`) silently did nothing while I thought the jobs were starting; caught because the targets stayed down.
 
+**Phase 7 (executed, passing):** full write-up in `docs/reliability.md`.
+- Drills (`make drill-*`), each ending in a check of Silver and Gold against the independent oracles: producer (backpressure 276 events, SIGTERM flush), graceful (Silver exit 0 instead of 143, 9/9), crash-after-write (idempotent 100,000 rows; control with idempotence off 119,997, one replayed batch; 6/6), cold start, broker failure (`kafka-2` down ~45 s, 10/10, ISR back in 28.5 s), SIGKILL of each Spark JVM at t+20/70/120 s (compose restarted all three in 12-17 s, 7/7).
+- `make test-spark`: **46 passed** (was 43; cold-start regression tests added).
+- Bugs found: exit 143 on stop (PID 1 was spark-submit); stale "table missing" view across processes; harness `prom(x) or 1` zero bug; wrong "exactly 20,000 duplicates" assertion; verifier JVM starving the 8 GB VM (drills now stop drivers gracefully before verifying); `docker kill` is not a crash (Docker never applies restart policy to it); recovery time, peak lag and alerts measured over wrong windows (fixed); stall detector too impatient for Gold's catch-up batches.
+- CI workflow written (`.github/workflows/ci.yml`); its steps were run locally (unit and API tests in a clean Python 3.12 venv from `requirements.txt`, promtool, compose config) but the workflow itself has **not** been run on GitHub.
+
 ## 6. Known limitations (so far)
 
 - 8 GB Docker VM: Airflow and Superset run under separate profiles, not alongside the full streaming stack.
@@ -178,15 +186,15 @@ flowchart LR
 - DLQ verified by message **count** only; DLQ payload contents are covered by unit tests of the build path, no DLQ consumer/reprocessor exists yet.
 - Avro decoding cannot detect *trailing* garbage after a valid record (decoder stops at record end); only structural failure is caught.
 - Silver MERGE creates small files per batch/partition; compaction (`OPTIMIZE`) is planned for the Airflow phase and not yet implemented.
-- The E2E run processed the 306k events as ONE micro-batch (`availableNow`); multi-batch behaviour was shown by the replay run and the unit tests, but the continuous trigger and mid-batch crash recovery are still undemonstrated (Phase 7).
+- The E2E run processed the 306k events as ONE micro-batch (`availableNow`); multi-batch behaviour was shown by the replay run and the unit tests, but the continuous trigger and mid-batch crash recovery are still undemonstrated (demonstrated in Phase 7).
 - `reset-data` is destructive (topics, lakehouse, checkpoints); local dev only.
 - **Late data beyond the watermark is dropped from the streaming Gold tables** (by design; bounded state). It is flagged (metric + verifier) but the repair path, a batch recompute of affected windows, is planned for the Airflow phase and **not implemented yet**.
 - Spark's watermark-drop counter is a lower bound (groups, not events), see Phase 4 findings.
-- Graceful shutdown of PySpark drivers is NOT demonstrated: `docker stop` signals the JVM (spark-submit), and the Python SIGTERM handlers in the jobs may never run. Phase 7 must test this rather than assume it.
+- (Resolved in Phase 7) Graceful shutdown: it did not work (exit 143); fixed and demonstrated, see docs/reliability.md.
 - Live demo drains by *quiescence* (Postgres total stable for 3 polls), not by an exact offset comparison.
 - Demand anomalies are a SQL z-score view (not streaming state); trip-level outliers are streaming. The 300k-row sample ends mid-minute, so the final window is partial (shows up as a spurious negative anomaly).
 - Gold Delta tables are small-file heavy (many upsert commits); `OPTIMIZE`/`VACUUM` still pending (Airflow phase). Gold tables use no Z-order.
-- Idempotent Gold upserts are proven by replaying a batch, not by killing a driver mid-batch (Phase 7).
+- Idempotent Gold upserts are proven by replaying a batch, not by killing a driver mid-batch (demonstrated in Phase 7).
 - Postgres credentials in `.env` are dev defaults.
 - API: single uvicorn worker, no auth/rate limiting/TLS (local dev), no response caching; `/v1/anomalies/demand` evaluates a window-function view over the whole minute table per call (fine at this scale, would need a materialized view or an index-backed table at larger scale).
 - `api_ro` password is a dev default (`api_ro_dev`) set in `init.sql`; rotate/override in any real deployment. `init.sql` role/grants apply to an existing database via `make pg-apply`.
@@ -197,3 +205,5 @@ flowchart LR
 - Latency/throughput numbers above come from one machine and one run each; no variance estimate.
 - Screenshots exist (`docs/screenshots/`, 10 images, `tools/screenshots/capture.mjs`); the pipeline dashboard image is a past-run window, the Prometheus images were taken with a replay + streaming jobs running.
 - Producer metrics only exist while a replay runs; the producer is not containerised.
+- Phase 7: single run per drill, no variance; two-broker/KRaft-quorum loss, MinIO and Postgres failure, and checkpoint deletion with a kept table are not tested; Spark-side backpressure under overload only partly evidenced.
+- Scope cut for the GitHub release: Airflow/dbt/Superset, compaction, late-data repair, rebuild-from-Bronze drill, benchmark report and live producer were **not built**.

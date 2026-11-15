@@ -1,0 +1,52 @@
+name: ci
+on:
+  push: {branches: [main, master]}
+  pull_request:
+
+jobs:
+  unit-and-static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12", cache: pip}
+      - run: pip install -r requirements.txt
+      - name: Unit tests (events, Avro round-trip, replay pacing)
+        run: PYTHONPATH=. python -m pytest tests/unit -q
+      - name: Grafana dashboards are in sync with their generator
+        run: |
+          PYTHONPATH=. python dashboards/build_dashboards.py
+          git diff --exit-code dashboards/grafana
+      - name: Prometheus alert rules are valid
+        run: docker run --rm --entrypoint promtool -v "$PWD/monitoring/prometheus:/p:ro" prom/prometheus:v2.55.1 check rules /p/rules.yml
+      - name: Compose file is valid
+        run: cp .env.example .env && docker compose --env-file .env -f infrastructure/docker-compose.yml --profile streaming --profile jobs config -q
+
+  api-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env: {POSTGRES_USER: mobility, POSTGRES_PASSWORD: mobility_dev, POSTGRES_DB: mobility}
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U mobility" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12", cache: pip}
+      - run: pip install -r requirements.txt
+      - name: API tests against a real Postgres (real DDL, real read-only role)
+        run: PYTHONPATH=. python -m pytest tests/integration/test_api.py -q
+
+  spark-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the Spark image (Spark 3.5.3 + Delta 3.2.1 + Kafka/Avro/S3A jars)
+        run: docker build -t mobility-spark:3.5.3 infrastructure/spark
+      - name: Spark tests (DQ rules, Silver batch, Gold windows + late data, metrics, cold start)
+        run: >-
+          docker run --rm -v "$PWD:/opt/app:ro" --entrypoint bash mobility-spark:3.5.3
+          /opt/app/infrastructure/spark/run_pytest.sh tests/spark

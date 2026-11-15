@@ -1,7 +1,7 @@
 COMPOSE = docker compose --env-file .env -f infrastructure/docker-compose.yml
 BOOTSTRAP = kafka-1:9092,kafka-2:9092,kafka-3:9092
 
-.PHONY: up down ps logs topics-describe clean
+.PHONY: up down ps logs topics-describe clean spark-image data
 
 up:
 	$(COMPOSE) up -d --wait
@@ -20,6 +20,15 @@ logs:
 
 topics-describe:
 	$(COMPOSE) exec kafka-1 /opt/kafka/bin/kafka-topics.sh --bootstrap-server $(BOOTSTRAP) --describe
+
+data:   ## download the NYC TLC sample (Jan 2024 yellow ~50 MB, green ~1.4 MB, zone lookup) into data/tlc
+	mkdir -p data/tlc
+	curl -fL -o data/tlc/yellow_tripdata_2024-01.parquet https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet
+	curl -fL -o data/tlc/green_tripdata_2024-01.parquet https://d37ci6vzurychx.cloudfront.net/trip-data/green_tripdata_2024-01.parquet
+	curl -fL -o data/tlc/taxi_zone_lookup.csv https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv
+
+spark-image:   ## build the Spark+Delta+Kafka image (jars baked in) used by every Spark job and the Spark tests
+	docker build -t mobility-spark:3.5.3 infrastructure/spark
 
 # ---- Phase 2 vertical slice ----
 SPARK_JOB = $(COMPOSE) --profile jobs run --rm spark-job
@@ -115,3 +124,8 @@ obs-demo:
 .PHONY: screenshots
 screenshots:   ## see docs/observability.md "Screenshots" for the live-state steps that make them look healthy
 	cd tools/screenshots && npm install --no-audit --no-fund --silent && node capture.mjs
+
+# ---- Phase 7 reliability drills (each injects a real failure; evidence in data/drills/*.json) ----
+.PHONY: drill-coldstart drill-producer drill-graceful drill-crash drill-broker drill-sigkill drill-rebuild
+drill-coldstart drill-producer drill-graceful drill-crash drill-broker drill-sigkill drill-rebuild:
+	$(PY) -m tests.recovery.drills $(subst drill-,,$@)

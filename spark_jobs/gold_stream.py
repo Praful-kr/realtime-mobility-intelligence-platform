@@ -15,13 +15,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
 from typing import Callable, List, Optional
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.streaming import StreamingQuery, StreamingQueryListener
 
-from spark_jobs.common import CHECKPOINT_ROOT, SILVER_PATH, build_spark, wait_for_delta_table
+from spark_jobs.common import CHECKPOINT_ROOT, SILVER_PATH, build_spark, run_until_stopped, wait_for_delta_table
 from spark_jobs.gold_aggregates import GOLD_SPECS, SILVER_NEEDED, GoldSpec
 from spark_jobs.gold_sinks import PgSink, delta_upsert
 from spark_jobs.metrics import start_metrics
@@ -112,24 +111,15 @@ def main() -> None:
 
     spark = build_spark("gold-stream")
     pg = None if args.no_postgres else PgSink()
+    prom_listener = start_metrics(spark)   # BEFORE waiting for upstream: a cold-starting job must be scrapeable (else TargetDown fires)
     wait_for_delta_table(spark, SILVER_PATH)
     listener = MetricsListener(pg)
     spark.streams.addListener(listener)
-    prom_listener = start_metrics(spark)
     queries = start_gold_queries(spark, SILVER_PATH, GOLD_ROOT, CHECKPOINT_ROOT, args.watermark, args.trigger,
                                  pg, load_zones(spark, ZONES_PATH), max_files_per_trigger=args.max_files_per_trigger)
 
-    def _stop(*_):
-        for q in queries:
-            q.stop()
-    signal.signal(signal.SIGTERM, _stop)
-    signal.signal(signal.SIGINT, _stop)
     try:
-        if args.trigger == "availableNow":
-            for q in queries:
-                q.awaitTermination()
-        else:
-            spark.streams.awaitAnyTermination()   # surfaces a failure in ANY query instead of hanging on the first
+        run_until_stopped(queries)
     finally:
         spark.streams.removeListener(listener)    # avoids py4j callback errors during JVM shutdown
         if prom_listener is not None:

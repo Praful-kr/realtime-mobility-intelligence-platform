@@ -14,12 +14,13 @@ write. => effectively-once into Bronze. (Demonstrated by tests/recovery, not ass
 from __future__ import annotations
 
 import argparse
-import signal
+import os
 
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
-from spark_jobs.common import BRONZE_PATH, CHECKPOINT_ROOT, KAFKA_BOOTSTRAP, RAW_TOPIC, build_spark
+from spark_jobs import chaos
+from spark_jobs.common import BRONZE_PATH, CHECKPOINT_ROOT, KAFKA_BOOTSTRAP, RAW_TOPIC, build_spark, run_until_stopped
 from spark_jobs.metrics import start_metrics
 
 APP_ID = "bronze-trips-raw"
@@ -44,9 +45,11 @@ def make_batch_writer(path: str):
         out = (to_bronze(batch_df)
                .withColumn("bronze_ingested_at", F.current_timestamp())
                .withColumn("ingest_date", F.to_date("bronze_ingested_at")))
-        (out.write.format("delta").mode("append")
-            .option("txnAppId", APP_ID).option("txnVersion", batch_id)  # idempotent re-run of a batch
-            .partitionBy("ingest_date").save(path))
+        w = out.write.format("delta").mode("append")
+        if os.getenv("BRONZE_DISABLE_TXN") != "1":   # drill-only switch: negative control for the idempotence test
+            w = w.option("txnAppId", APP_ID).option("txnVersion", batch_id)  # idempotent re-run of a batch
+        w.partitionBy("ingest_date").save(path)
+        chaos.maybe_crash(out.sparkSession, "bronze", batch_id)
     return write_batch
 
 
@@ -74,13 +77,8 @@ def main() -> None:
               else writer.trigger(processingTime=f"{int(args.trigger)} seconds"))
     query = writer.start()
 
-    def _graceful(_signum, _frame):  # finish the in-flight batch, then stop
-        query.stop()
-
-    signal.signal(signal.SIGTERM, _graceful)
-    signal.signal(signal.SIGINT, _graceful)
     try:
-        query.awaitTermination()
+        run_until_stopped([query])
     finally:
         if listener is not None:
             spark.streams.removeListener(listener)
