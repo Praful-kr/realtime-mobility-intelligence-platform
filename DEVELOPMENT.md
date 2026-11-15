@@ -94,7 +94,8 @@ flowchart LR
 - [x] Phase 2: vertical slice producer -> Kafka -> Bronze Delta on MinIO (verified, section 5)
 - [x] Phase 3: Silver: validation, quarantine, dedup, DQ score/report (verified against independent oracle, section 5)
 - [x] Phase 4: Gold windows (tumbling+sliding, watermark) -> Delta MERGE + Postgres upsert; live concurrent run (section 5)
-- [ ] Phase 5: FastAPI + health/readiness
+- [x] Phase 5: FastAPI service over Gold (11 endpoints), health/readiness, JSON logs, Prometheus metrics (section 5)
+- [ ] Phase 6: Prometheus + Grafana, Kafka lag exporter, dashboards
 
 ## 5. Test results
 
@@ -133,6 +134,18 @@ flowchart LR
 3. py4j errors at Gold shutdown (listener torn down mid-callback): listener removed and Spark stopped in `finally`.
 4. Live-demo script hung forever when drivers died; now fails fast with logs.
 
+**Phase 5 (executed, passing):**
+- API (`api/`, FastAPI 0.163, port 8000, container `mobility-api`, 256 MB limit, compose healthcheck = `/health/ready`). Endpoints: `/health/live`, `/health/ready`, `/v1/trips/per-minute`, `/v1/demand/{sliding,hourly,by-hour-of-day}`, `/v1/zones/top`, `/v1/zones/{id}/trend`, `/v1/anomalies/{counts,demand}`, `/v1/pipeline/status`, `/metrics`. OpenAPI at `/docs`.
+- Security/robustness: read-only Postgres role `api_ro` (verified: SELECT ok, DELETE denied), parameterized SQL + whitelisted table names, enum/range-validated params (422), bounded `limit`, `statement_timeout` 5 s, 503 + `Retry-After` on DB outage, process stays alive and `/health/live` stays 200 while `/health/ready` is 503.
+- `make test` (9) + `make test-api` (**29 integration tests**, real throwaway Postgres DB with the real DDL, real read-only role, deterministic seed): values/order/filters/limit/exclusive end, default window anchored on newest data, naive=UTC, empty DB returns `[]`, 11 invalid-input cases, SQL-injection attempts inert (long payload 422, short payload stays a literal; table intact), DB-down behaviour, request-id echo, metrics use route templates (no label explosion), structured access log fields, **pool burst (60 requests / 2 connections all 200) and true saturation (503 after bounded wait, then recovery)**.
+- **E2E vs independent raw-parquet oracle (`make e2e-api`) PASS:** per-minute rows (8,289) every trips/revenue value, SUM(trips)=295,419=valid distinct events, taxi_type filter, all 1,076 sliding windows, hour-of-day, top-10 pickup zones (#1 JFK, 20,848 trips), zone trend, every (minute,type) anomaly count, demand anomalies (|z|>3, top z=40.3 at the New-Year midnight), pipeline status (5 queries). Concurrency smoke: 400 requests / 20 threads all 200 (p50 160 ms, p95 270 ms; single uvicorn worker, NOT a benchmark).
+
+**Defects found while building Phase 5 (all fixed):**
+1. psycopg2's `ThreadedConnectionPool` does not wait when empty: the first load smoke returned 503 (`connection pool exhausted`) at 20 concurrent requests with an idle database. Fixed with a bounded semaphore (queue up to `API_DB_ACQUIRE_TIMEOUT_S`=3 s, then 503); regression tests above.
+2. Float noise in sums (`442936.13999999984`) now rounded to 4 dp at the API boundary.
+3. Docker builds could not reach PyPI (read timeouts, twice, even with retries; host pip too). API deps are now vendored for linux/arm64 with `uv` (`make api-vendor`, `api/vendor/` git-ignored), so the image builds with no PyPI access.
+4. My e2e script had a syntax error and one test expectation was wrong (49-char payload correctly rejected by `max_length=40`); fixed, not worked around.
+
 ## 6. Known limitations (so far)
 
 - 8 GB Docker VM: Airflow and Superset run under separate profiles, not alongside the full streaming stack.
@@ -159,3 +172,7 @@ flowchart LR
 - Gold Delta tables are small-file heavy (many upsert commits); `OPTIMIZE`/`VACUUM` still pending (Airflow phase). Gold tables use no Z-order.
 - Idempotent Gold upserts are proven by replaying a batch, not by killing a driver mid-batch (Phase 7).
 - Postgres credentials in `.env` are dev defaults.
+- API: single uvicorn worker, no auth/rate limiting/TLS (local dev), no response caching; `/v1/anomalies/demand` evaluates a window-function view over the whole minute table per call (fine at this scale, would need a materialized view or an index-backed table at larger scale).
+- `api_ro` password is a dev default (`api_ro_dev`) set in `init.sql`; rotate/override in any real deployment. `init.sql` role/grants apply to an existing database via `make pg-apply`.
+- DQ metrics/reports are in Delta only; they are not served through the API yet.
+- Defaults for omitted time ranges are anchored on the newest data in the table, not wall-clock (replayed history); documented in the endpoint behaviour, covered by a test.

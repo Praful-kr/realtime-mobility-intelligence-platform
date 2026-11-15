@@ -54,3 +54,13 @@ stats AS (
 SELECT window_start, trips, trailing_mean, trailing_sd,
        (trips - trailing_mean) / NULLIF(trailing_sd, 0) AS z_score
 FROM stats WHERE trailing_sd > 0 AND ABS((trips - trailing_mean) / trailing_sd) > 3;
+
+-- Least-privilege role for the API (dev password; override in any real deployment)
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'api_ro') THEN
+    CREATE ROLE api_ro LOGIN PASSWORD 'api_ro_dev';
+  END IF;
+END $$;
+GRANT USAGE ON SCHEMA gold TO api_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA gold TO api_ro;
+ALTER DEFAULT PRIVILEGES IN SCHEMA gold GRANT SELECT ON TABLES TO api_ro;

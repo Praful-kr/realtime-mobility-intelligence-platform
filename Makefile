@@ -74,3 +74,18 @@ pg-apply:  ## re-apply the (idempotent) serving DDL to a running Postgres
 
 psql:
 	docker exec -it mobility-postgres-1 psql -U mobility -d mobility
+
+# ---- Phase 5 API ----
+.PHONY: api-vendor api-up test-api e2e-api
+api-vendor:   ## vendor linux/arm64 deps for the API image (no PyPI access needed at docker build)
+	rm -rf api/vendor
+	uv pip install -q --target api/vendor --python-platform aarch64-unknown-linux-gnu --python-version 3.12 -r api/requirements.txt
+
+api-up: api-vendor
+	$(COMPOSE) up -d --build --wait api
+
+test-api:
+	$(PY) -m pytest tests/integration/test_api.py -q
+
+e2e-api:
+	$(PY) -m tests.e2e.api_check --n $(or $(N),300000) --null-every $(or $(NULLP),1009)
