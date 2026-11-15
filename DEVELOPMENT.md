@@ -91,7 +91,8 @@ flowchart LR
 - [x] Dataset research and verification
 - [x] Architecture + plan
 - [x] Phase 1: scaffold + core stack (verified 2026-11-15, see section 5)
-- [ ] Phase 2: vertical slice (producer -> Bronze)
+- [x] Phase 2: vertical slice producer -> Kafka -> Bronze Delta on MinIO (verified, section 5)
+- [ ] Phase 3: Silver (validation, quarantine, dedup, DQ score)
 
 ## 5. Test results
 
@@ -102,6 +103,15 @@ flowchart LR
 - Schema Registry `GET /config` -> `BACKWARD`; Kafka UI `/actuator/health` -> `UP`; MinIO `/minio/health/live` -> 200; buckets `lakehouse`, `checkpoints` exist (`mc ls`).
 - Idle memory: brokers ~340 MB each, Kafka UI 286 MB, SR 251 MB, MinIO 204 MB = ~1.76 GB of the 8 GB VM.
 
+**Phase 2 (executed, passing):**
+- `pytest tests/unit`: 9 passed (deterministic event IDs, NaN/int-overflow handling, DLQ-bound rows, Avro round-trip, replay clock pacing with a fake clock).
+- `make topics`: `trips.raw.v1` (6 partitions, RF=3, min ISR 2), `trips.dlq.v1` (3 partitions).
+- `make produce SPEED=0 LIMIT=200000`: sent=200000 acked=200000 failed=0 dlq=0, 6.4 s (~31k events/s, single Python process, idempotent + acks=all + lz4). Schema registered as id 1.
+- `make bronze` (availableNow) then `make verify-bronze`: **PASS** — Bronze rows 200000 == Kafka rows 200000 == distinct (topic,partition,offset) 200000 == distinct decoded event_id 200000 (yellow 196229, green 3771). 26 MiB in MinIO.
+- Re-running `make bronze` against the same checkpoint added no rows (still PASS).
+
+**Not yet demonstrated (do not read as claimed):** DLQ path on real data (the 200k slice are the earliest-sorted rows, none have null pickup; only unit-tested), mid-batch crash recovery, continuous (non-availableNow) trigger, replay at 1x/10x/100x wall-clock (only the clock math is unit-tested), duplicate re-ingestion.
+
 ## 6. Known limitations (so far)
 
 - 8 GB Docker VM: Airflow and Superset run under separate profiles, not alongside the full streaming stack.
@@ -109,3 +119,8 @@ flowchart LR
 - Wikimedia is live but not mobility data; it validates live-ingestion mechanics, not mobility analytics.
 - **MinIO image:** upstream `minio/minio` and `quay.io/minio/minio` can no longer be pulled (access denied). Using `bitnamilegacy/minio:2025.7.23`: real MinIO but frozen, no security patches, and no web console (community console removed upstream). Inspect buckets with `mc`. Local dev only. Fallback if this disappears: SeaweedFS or RustFS (both pullable, S3-compatible).
 - Docker VM left at 8 GB (no answer on raising it); plan unchanged.
+- Spark jobs currently run `local[2]` in a one-shot container, not on a standalone master/worker; chosen to stay inside 8 GB. Horizontal-scaling story will be documented, not demonstrated, unless a cluster profile is added.
+- Spark INFO logging is noisy at startup (log4j default applies before `setLogLevel`); cosmetic.
+- TLC timestamps are NYC local wall-clock; stored as-is and interpreted as UTC (no DST conversion). Hour-of-day demand therefore equals NYC local hour.
+- Partition key = event_id (uniform spread, no per-zone ordering). Keying by PULocationID would give locality but hot partitions (JFK/LGA).
+- Bronze `txnVersion = batchId` idempotence holds only while the checkpoint exists; deleting a checkpoint without clearing the table would re-append.
